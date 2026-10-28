@@ -1,0 +1,32 @@
+# ---- 生成物：渲染图与证据图（每轮都在变，不入库）----
+out/
+probe_out/
+
+# ---- Blender 二进制场景 ----
+*.blend
+*.blend1
+*.blend2
+
+# ---- 第三方克隆（自带 .git，见 README 里的来源链接）----
+dream-loop/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 工具/编辑器状态 ----
+.rscode/
+.vscode/
+.idea/
+*.log
+*.err
+.DS_Store
+Thumbs.db
+
+# ---- 密钥一律不入库 ----
+.env
+*.key
+*.pem
+secrets.json
