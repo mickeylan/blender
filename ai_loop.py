@@ -35,7 +35,14 @@ OPENCODE_CFG = os.path.join(os.path.expanduser("~"), ".config", "opencode", "ope
 PROVIDERS = {
     "ali":      {"provider": "ali-coding-plan",   "model": "qwen3.5-plus"},
     "minimax":  {"provider": "minimax-mickeylan", "model": "MiniMax-M2.5"},
+    # 视觉实测（LESSONS [040]）：只有 qwen3.5-plus 与 kimi-k2.5 真能看图。
+    # glm-5 / MiniMax-M2.5 会回复"没有上传图片"；qwen3-max / qwen3-coder-* 该端点报错。
+    # 因此独立评审只能在这两者之间交叉。
+    "kimi":     {"provider": "ali-coding-plan",   "model": "kimi-k2.5"},
 }
+
+# 实测能看图、可做评审的模型
+VISION_CAPABLE = {"qwen3.5-plus", "kimi-k2.5"}
 
 # ---------------------------------------------------------------- 禁止模式
 # LESSONS.md [002]：这些调用会重置 Blender，连带杀死 MCP socket 服务
@@ -851,12 +858,16 @@ _frame_camera()
 
 # 固定证据机位（照 blender-visual-craft skill 的 review.md 规范）
 # LESSONS [036]：critic 只看单视图无法判断三维结构；且必须区分"形体问题"与"材质问题"。
-# 故每轮产出：hero 透视（材质） + front/right/back 正交（材质） + clay 灰模（只留形体）。
+# LESSONS [038]：跨轮必须固定相机矩阵，否则自动重框会让两轮图不可严格对照
+#               （skill 明确警告："不能直接把两张自动取景图当作严格对照"）。
+# 故每轮产出：hero 透视 + front/right/back 正交 + clay 灰模，并回传 CAM_STATE。
 VIEW_SETUP_SNIPPET = r'''
+import json as _json
 import math as _m2
 from mathutils import Vector as _V2
 _KIND = "{kind}"
 _CLAY = {clay}
+_LOCK = {lock}
 
 def _bounds():
     bpy.context.view_layer.update()
@@ -884,7 +895,6 @@ if _cam is None:
     _sc.collection.objects.link(_cam)
     _sc.camera = _cam
 
-# 视线方向（照 skill：-Y 正面 / +X 右侧 / +Y 背面 / +Z 顶部）
 _DIRS = {{
     "front": _V2((0, -1, 0)),
     "right": _V2((1, 0, 0)),
@@ -893,32 +903,51 @@ _DIRS = {{
     "top":   _V2((0, 0, 1)),
 }}
 
-if _KIND in _DIRS:
-    _cam.data.type = 'ORTHO'
-    _cam.location = _ctr + _DIRS[_KIND] * _extent * 2.0
-    _cam.rotation_euler = (_ctr - _cam.location).to_track_quat('-Z', 'Y').to_euler()
-    # 精确正交框选：把角点投影到相机 right/up 基向量上（照 skill 的做法）
-    _rot = _cam.rotation_euler.to_matrix()
-    _right, _up = _rot.col[0], _rot.col[1]
-    _xx = [_right.dot(p - _ctr) for p in _pts]
-    _yy = [_up.dot(p - _ctr) for p in _pts]
-    _cam.data.ortho_scale = max(max(_xx) - min(_xx), max(_yy) - min(_yy)) * 1.16
+_locked = False
+if _LOCK and _KIND in _LOCK:
+    _L = _LOCK[_KIND]
+    _cam.location = tuple(_L["loc"])
+    _cam.rotation_euler = tuple(_L["rot"])
+    if _L.get("type") == "ORTHO":
+        _cam.data.type = 'ORTHO'
+        _cam.data.ortho_scale = _L["ortho"]
+    else:
+        _cam.data.type = 'PERSP'
+        _cam.data.lens = _L["lens"]
+    if _L.get("res"):
+        _sc.render.resolution_x, _sc.render.resolution_y = _L["res"]
     _cam.data.clip_start = 0.001
     _cam.data.clip_end = _extent * 10
-    print("VIEW %s ortho scale=%.2f" % (_KIND, _cam.data.ortho_scale))
-else:
-    _cam.data.type = 'PERSP'
-    print("VIEW persp")
+    _locked = True
+    print("CAM_LOCKED %s" % _KIND)
 
-# ---- clay 灰模：只留形体，排除材质/光照干扰（skill 明确要求保留灰模证据）----
+if not _locked:
+    if _KIND in _DIRS:
+        _cam.data.type = 'ORTHO'
+        _cam.location = _ctr + _DIRS[_KIND] * _extent * 2.0
+        _cam.rotation_euler = (_ctr - _cam.location).to_track_quat('-Z', 'Y').to_euler()
+        # 精确正交框选：角点投影到相机 right/up 基向量
+        _rot = _cam.rotation_euler.to_matrix()
+        _right, _up = _rot.col[0], _rot.col[1]
+        _xx = [_right.dot(p - _ctr) for p in _pts]
+        _yy = [_up.dot(p - _ctr) for p in _pts]
+        _cam.data.ortho_scale = max(max(_xx) - min(_xx), max(_yy) - min(_yy)) * 1.16
+        _cam.data.clip_start = 0.001
+        _cam.data.clip_end = _extent * 10
+        print("VIEW %s ortho scale=%.2f" % (_KIND, _cam.data.ortho_scale))
+    else:
+        _cam.data.type = 'PERSP'
+        print("VIEW persp")
+
+# ---- clay 灰模：只留形体，排除材质/光照干扰 ----
 if _CLAY:
     _sc.render.engine = 'BLENDER_WORKBENCH'
     _sc.render.use_compositing = False
     _sc.display.shading.light = 'STUDIO'
     _sc.display.shading.color_type = 'SINGLE'
     _sc.display.shading.single_color = (0.55, 0.55, 0.55)
-    # 阴影：正交顶视会产生条带伪影故关掉，但透视灰模需要阴影才看得出形体起伏
-    # （实测关掉后 StdDev 只有 11，形体读不出来）
+    # 正交顶视会出阴影条带故关掉；但透视灰模需要阴影才看得出形体起伏
+    # （实测全关后 StdDev 只有 11，形体读不出来）
     _sc.display.shading.show_shadows = (_KIND not in ("top",))
     _sc.display.shading.show_cavity = True
     _sc.display.shading.cavity_type = 'BOTH'
@@ -928,7 +957,7 @@ if _CLAY:
     _sc.world.color = (0.12, 0.12, 0.12)
     print("CLAY workbench")
 else:
-    # LESSONS [034]：模型常把世界背景设得很亮，Standard 下冲成一片白，主体"灰蒙蒙"。
+    # LESSONS [034]：模型常把世界背景设得很亮，Standard 下冲成一片白，主体"灰蒙蒙"
     try:
         _w = _sc.world
         if _w and _w.use_nodes:
@@ -946,8 +975,17 @@ else:
 _sc.render.filepath = r"{path}"
 _sc.render.image_settings.file_format = 'PNG'
 
-# 记录机位，供跨轮对比（skill: 固定相机矩阵，否则两张自动取景图不可严格对照）
-print("CAM_MATRIX %s" % " ".join("%.6f" % v for row in _cam.matrix_world for v in row))
+# 回传相机状态，供后续轮次锁定复用
+# ortho 只对正交相机有意义；PERSP 记 0，避免把默认值 6.0 当成有效参数误导排查
+print("CAM_STATE " + _json.dumps({{
+    "kind": _KIND,
+    "loc": [round(v, 6) for v in _cam.location],
+    "rot": [round(v, 6) for v in _cam.rotation_euler],
+    "type": _cam.data.type,
+    "lens": round(_cam.data.lens, 6),
+    "ortho": round(_cam.data.ortho_scale, 6) if _cam.data.type == 'ORTHO' else 0.0,
+    "res": [_sc.render.resolution_x, _sc.render.resolution_y],
+}}, ensure_ascii=False))
 '''
 
 
@@ -992,6 +1030,11 @@ def make_client(base_url: str, api_key: str):
 class Session:
     def __init__(self):
         self.c = BlenderMCP(timeout=180)
+        # 跨轮固定的检查相机（LESSONS [038]）：首轮自动取景后记录，
+        # 后续轮原样复用 —— 否则每轮重框会让两轮的图不可严格对照。
+        self.cam_lock: dict | None = None
+        self.lock_size: tuple | None = None      # 锁定时模型的包围盒尺寸
+        self.overflow_note: str | None = None    # 本轮机位溢出/裁切的提示
 
     def connect(self):
         self.c.connect()
@@ -1034,6 +1077,10 @@ class Session:
 
     def scene_bbox(self) -> str:
         """量取场景真实包围盒，作为硬数据喂给 critic（比看图估尺寸可靠）。"""
+        return self.scene_size_str()
+
+    def scene_size(self) -> tuple[float, float, float] | None:
+        """量取包围盒尺寸 (宽, 深, 高)。"""
         code = (
             "import bpy\n"
             "from mathutils import Vector as _Vb\n"
@@ -1046,20 +1093,28 @@ class Session:
             "        _lo = _Vb((min(_lo.x,_p.x),min(_lo.y,_p.y),min(_lo.z,_p.z)))\n"
             "        _hi = _Vb((max(_hi.x,_p.x),max(_hi.y,_p.y),max(_hi.z,_p.z)))\n"
             "_d = _hi - _lo\n"
-            "print('BBOX %.2f %.2f %.2f ZMIN %.2f ZMAX %.2f' % "
+            "print('BBOX %.4f %.4f %.4f ZMIN %.4f ZMAX %.4f' % "
             "(_d.x,_d.y,_d.z,_lo.z,_hi.z))\n"
         )
         r = self.c.execute_code(code)
         out = str(r.get("result", {}).get("result", ""))
-        m = re.search(r"BBOX\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+ZMIN\s+([-\d.]+)\s+ZMAX\s+([-\d.]+)", out)
+        m = re.search(
+            r"BBOX\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+ZMIN\s+([-\d.]+)\s+ZMAX\s+([-\d.]+)",
+            out)
         if not m:
+            return None
+        return (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+
+    def scene_size_str(self) -> str:
+        s = self.scene_size()
+        if s is None:
             return "未知"
-        return (f"宽 {m.group(1)}m × 深 {m.group(2)}m × 高 {m.group(3)}m"
-                f"（z 从 {m.group(4)} 到 {m.group(5)}）")
+        return f"宽 {s[0]:.2f}m × 深 {s[1]:.2f}m × 高 {s[2]:.2f}m"
 
     def render(self, name: str) -> str | None:
-        """单视图（3/4 透视）。"""
-        return self._render_one(name, "persp")
+        """单视图（3/4 透视）。保持返回路径，兼容既有调用。"""
+        path, _cam = self._render_one(name, "persp")
+        return path
 
     def render_views(self, prefix: str) -> list[tuple[str, str]]:
         """固定证据渲染：hero 透视 + front/right/back 正交 + clay 灰模。
@@ -1067,7 +1122,7 @@ class Session:
         照 blender-visual-craft skill 的 review.md：
           - 保留标准正面/侧面/背面与展示视角
           - 另存灰模证据，避免"材质问题"与"形体问题"混淆
-        每张都打印相机矩阵，便于跨轮严格对照。
+          - **跨轮固定相机**：首轮自动取景后记录，后续轮原样复用
         """
         out = []
         plan = [
@@ -1077,24 +1132,58 @@ class Session:
             ("back", "back", False),
             ("clay", "persp", True),
         ]
+        cam_states = {}
         for suffix, kind, clay in plan:
-            p = self._render_one(f"{prefix}_{suffix}.png", kind, clay)
+            p, cam = self._render_one(f"{prefix}_{suffix}.png", kind, clay)
             if p:
                 out.append((suffix, p))
+            if cam:
+                cam_states[suffix] = cam
+
+        # 首轮：把各通道相机定死，之后每轮复用（LESSONS [038]）
+        if self.cam_lock is None:
+            if len(cam_states) == len(plan):
+                self.cam_lock = cam_states
+                self.lock_size = self.scene_size()
+                print("  [cam] 已锁定 %d 个检查机位（基准尺寸 %s），后续轮次沿用"
+                      % (len(cam_states), self.scene_size_str()))
+        else:
+            print("  [cam] 沿用已锁定的检查机位")
+            # 固定机位 + 模型变大 = 裁切。这是真实缺陷信号，必须报出来，
+            # 不能悄悄重框（那会让两轮不可比，skill 明确警告过）。
+            cur = self.scene_size()
+            if cur and self.lock_size:
+                ratios = [c / l if l > 1e-6 else 1.0
+                          for c, l in zip(cur, self.lock_size)]
+                if max(ratios) > 1.02:
+                    self.overflow_note = (
+                        f"本轮模型 {cur[0]:.2f}×{cur[1]:.2f}×{cur[2]:.2f}m 超出"
+                        f"基准取景 {self.lock_size[0]:.2f}×{self.lock_size[1]:.2f}"
+                        f"×{self.lock_size[2]:.2f}m（最大 {max(ratios):.2f} 倍），"
+                        f"正交视图边缘有裁切")
+                    print("  [cam] !! FRAME_OVERFLOW " + self.overflow_note)
+                else:
+                    self.overflow_note = None
         return out
 
     def _render_one(self, name: str, kind: str = "persp",
-                    clay: bool = False) -> str | None:
+                    clay: bool = False) -> tuple[str | None, dict | None]:
+        """渲染单通道。返回 (文件路径, 相机状态)。
+
+        相机已锁定时不再前置自动取景，否则会把锁定值覆盖掉。
+        """
         path = os.path.join(OUT_DIR, name)
         safe = path.replace("\\", "\\\\")
-        # 渲染前强制重设相机（LESSONS [016]/[019]/[023]/[033]）
+        locked = self.cam_lock is not None
+        lock_literal = repr(self.cam_lock) if locked else "None"
         code = (
             "import bpy\n"
-            + FRAME_SNIPPET
+            + ("" if locked else FRAME_SNIPPET)
             + VIEW_SETUP_SNIPPET.format(
                 kind=kind,
                 path=safe,
                 clay="True" if clay else "False",
+                lock=lock_literal,
             )
             + "bpy.ops.render.render(write_still=True)\n"
             f"print('RENDERED {name}')\n"
@@ -1102,12 +1191,20 @@ class Session:
         r = self.c.execute_code(code)
         if r.get("status") != "success":
             print("  render error:", str(r.get("message"))[:300])
-            return None
+            return None, None
         out = str(r.get("result", {}).get("result", ""))
+        cam = None
         for line in out.splitlines():
-            if line.startswith(("FRAMED", "FRAME_SKIP", "VIEW ", "CLAY", "BG_CLAMPED")):
-                print("  " + line.strip())
-        return path if os.path.exists(path) else None
+            line = line.strip()
+            if line.startswith("CAM_STATE "):
+                try:
+                    cam = json.loads(line[len("CAM_STATE "):])
+                except Exception:                          # noqa: BLE001
+                    pass
+            elif line.startswith(("FRAMED", "FRAME_SKIP", "VIEW ", "CLAY",
+                                  "BG_CLAMPED", "CAM_LOCKED")):
+                print("  " + line)
+        return (path if os.path.exists(path) else None), cam
 
     def scene_brief(self) -> str:
         r = self.c._send({"type": "get_scene_info", "params": {}})
@@ -1280,16 +1377,34 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--provider", default="ali", choices=list(PROVIDERS))
     ap.add_argument("--model", default=None)
+    ap.add_argument("--critic-provider", default=None, choices=list(PROVIDERS),
+                    help="评审用另一个 provider（默认与建模同源，属自检）")
+    ap.add_argument("--critic-model", default=None,
+                    help="评审模型；与建模模型不同才算独立评审")
     ap.add_argument("--keep-on-disk", action="store_true", default=True)
     args = ap.parse_args()
 
     base_url, api_key, model = load_provider(args.provider)
     if args.model:
         model = args.model
-    print(f"[cfg] provider={args.provider} model={model}")
-    print(f"[cfg] base_url={base_url}")
-
+    print(f"[cfg] builder  provider={args.provider} model={model}")
     client = make_client(base_url, api_key)
+
+    # 独立评审（LESSONS [039]）：同模型既写代码又评分会有自我一致性偏差。
+    # 显式指定不同的 critic 才算独立评审；否则如实标注为自检。
+    if args.critic_provider or args.critic_model:
+        c_provider = args.critic_provider or args.provider
+        c_url, c_key, c_model = load_provider(c_provider)
+        if args.critic_model:
+            c_model = args.critic_model
+        critic_client = make_client(c_url, c_key)
+        independent = (c_model != model)
+        print(f"[cfg] critic   provider={c_provider} model={c_model}  "
+              f"{'独立评审' if independent else '同模型自检'}")
+    else:
+        critic_client, c_model = client, model
+        independent = False
+        print("[cfg] critic   与 builder 同模型 —— 这是自检，不是独立评审")
 
     s = Session()
     info = s.connect()
@@ -1370,10 +1485,13 @@ def main() -> int:
                        f"建模目标：{args.goal}\n\n"
                        f"实测数据（Blender 直接量取，比看图估算准确，以此为准）：\n"
                        f"  构件数 = {res.get('result', {}).get('mesh_count', '?')}\n"
-                       f"  包围盒 = {bbox}\n\n"
-                       f"注意：第 5 张是灰模，它只反映**形体**；如果灰模上形体正确而彩色图看着不对，\n"
+                       f"  包围盒 = {bbox}\n"
+                       + (f"  ⚠ 取景提示：{s.overflow_note}\n"
+                          if s.overflow_note else
+                          "  取景提示：本轮与基准机位一致，视图无裁切。\n")
+                       + f"\n注意：第 5 张是灰模，它只反映**形体**；如果灰模上形体正确而彩色图看着不对，\n"
                        f"那是材质/光照问题，不要当成建模缺陷。请用实测数字做尺寸核对。"})
-        verdict_text = ask_retry(client, model, CRITIC_SYSTEM, blocks,
+        verdict_text = ask_retry(critic_client, c_model, CRITIC_SYSTEM, blocks,
                                  max_tokens=3072, tag="critic")
         if verdict_text is None:
             print("  [critic] 重试耗尽，保留本轮渲染")
@@ -1391,11 +1509,16 @@ def main() -> int:
             continue
 
         total = verdict.get("total", 0)
+        verdict["_critic"] = {
+            "model": c_model,
+            "independent": independent,
+        }
         print(f"  [score] total={total} "
               f"structure={verdict.get('structure')} "
               f"composition={verdict.get('composition')} "
               f"materials={verdict.get('materials')} "
-              f"details={verdict.get('details')}")
+              f"details={verdict.get('details')}  "
+              f"({'独立评审' if independent else '自检'}:{c_model})")
 
         # skill review.md：逐项 pass/fail/unclear，并注明证据图
         for c in (verdict.get("checks") or [])[:10]:

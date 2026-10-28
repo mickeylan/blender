@@ -38,11 +38,12 @@ for i in range(N):
     th = math.pi * (i + 0.5) / N
     cx = -R * math.cos(th)
     cz = AH - R + R * math.sin(th)
-    box('Arch_%02d' % i, (AW * math.pi / N * 1.15, BD * 0.98, 0.26),
+    # 券石深度收进 4%，否则会比基座深（实测 kick 到 4.69m，超目标）
+    box('Arch_%02d' % i, (AW * math.pi / N * 1.15, BD * 0.94, 0.26),
         (cx, 0, cz + 0.12), (0, math.degrees(th) - 90, 0), stone)
 
-# 台面压顶
-box('Base_Cap', (BW + 0.5, BD + 0.5, 0.22), (0, 0, BH + 0.11), None, stone)
+# 台面压顶：**内收**并嵌在 BH 以内，否则整体会超 8x4x3
+box('Base_Cap', (BW - 0.06, BD - 0.06, 0.22), (0, 0, BH - 0.11), None, stone)
 bevel(bpy.data.objects['Base_Cap'], 0.03)
 
 # ---------- 两层楼阁 ----------
@@ -75,17 +76,20 @@ def tier(idx, z0, h, rooffoot_w, rooffoot_d, ridge_h):
     rise = ridge_h - (z0 + h)
     roof = curved_roof('T%d_Roof' % idx, rooffoot_w, rooffoot_d,
                        ridge_h=ridge_h, eave_h=z0 + h,
-                       overhang=0.55, corner_lift=rise * 0.35,
+                       overhang=0.55, corner_lift=rise * 0.55,
                        curve=2.4, material=tile, ridge_mat=ridgeW)
     return roof
 
-T1_Z = BH + 0.22
+T1_Z = BH
 T1_H = 2.5
-r1 = tier(1, T1_Z, T1_H, 6.2, 3.4, ridge_h=T1_Z + T1_H + 1.55)
+# 一层屋顶必须**出挑到基座之外**（基座 8.0 宽 -> 屋顶 7.6+1.1=8.7 宽）。
+# 独立评审 kimi-k2.5 指出"屋檐比基座窄"是真实缺陷，已核实并修正。
+r1 = tier(1, T1_Z, T1_H, 7.6, 3.9, ridge_h=T1_Z + T1_H + 1.75)
 
 T2_Z = T1_Z + T1_H + 0.05
 T2_H = 2.5
-r2 = tier(2, T2_Z, T2_H, 4.6, 2.6, ridge_h=T2_Z + T2_H + 1.30)
+# 二层按一层屋面收分
+r2 = tier(2, T2_Z, T2_H, 5.4, 2.9, ridge_h=T2_Z + T2_H + 1.45)
 
 area_light('KeyFill', (-8, -11, 9), 420, 12, (0, 0, 4))
 stats('CITY GATE ')
