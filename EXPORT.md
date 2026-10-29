@@ -110,6 +110,8 @@ D:\python3\python.exe .\blender_client.py .\blender_export.py
 | 8 | EXR 线性、PNG 被 sRGB 编码 | PNG 深度要解码才有米制意义 | 深度/法线一律出 EXR + npy，PNG 只给彩模/灰模 |
 | 9 | 深度图是 `[near,far]→[1,0]` 线性映射 | far 拉到 1000m 时深度图没法用 | 导出时按场景收紧 near/far，导完还原 |
 | 10 | PowerShell 内联脚本里的中文/三引号 | `SyntaxError: unterminated triple-quoted string` | 一律写成 `.py` 文件再执行 |
+| 11 | 还原逻辑写在正常路径末尾 | 脚本中途一崩，`material_override` **永久留在场景里**，之后每次渲染都被污染且**不报错** | 还原放 `finally`，并有故障注入回归测试 |
+| 12 | 写给 Blender 执行的 .py 带 BOM | `SyntaxError: invalid non-printable character U+FEFF` | 一律无 BOM 的 UTF-8 |
 
 ---
 
@@ -152,3 +154,16 @@ Blender 的相机空间是 **+Y 朝上**还是朝下取决于相机轴向，
 脚本会保存并还原：渲染引擎、输出路径/格式/位深、分辨率、视图变换、
 合成器开关、film_transparent、`material_override`、相机的 clip_start/clip_end、
 Workbench 着色设置。**不会**碰任何物体的材质槽、变换或可见性。
+
+**还原放在 `finally` 里**：脚本中途抛异常也一定还原。
+（早前把还原放在正常路径末尾，一次 `NameError` 就把
+`material_override` 永久留在场景里，之后每次渲染都被污染且不报错。）
+
+故障注入回归测试：
+
+```powershell
+D:\python3\python.exe probes\test_export_failpath.py     # 期望输出 FAILPATH OK
+```
+
+它会生成一份在深度渲染之后 `raise` 的故障版，跑完后断言
+`material_override`、相机裁剪面、渲染引擎三项都没被弄脏。

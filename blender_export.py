@@ -312,203 +312,231 @@ def read_px(arr, px, py):
 
 
 # ================================================================ 主流程
-report = []
-def say(s):
-    report.append(s)
-    print(s)
+def main():
+    """主体。**必须**由下面的 try/finally 调用：
+    脚本中途抛异常时如果不还原，material_override 会留在场景里，
+    之后的每一次渲染都会被 override 材质污染（实测踩到过）。
+    """
+    global NEAR, FAR
+    report = []
+    def say(s):
+        report.append(s)
+        print(s)
 
 
-say("=" * 70)
-say("EXPORT %s   %dx%d" % (NAME, W, H))
-say("=" * 70)
+    say("=" * 70)
+    say("EXPORT %s   %dx%d" % (NAME, W, H))
+    say("=" * 70)
 
-# 收紧裁剪面：深度图把 [near, far] 线性映射到 [1,0]，far 太大就没精度
-_n, _f = scene_depth_range()
-say("裁剪面: 原 near=%.4g far=%.4g  ->  导出用 near=%.4g far=%.4g" % (
-    _state["clip_start"], _state["clip_end"], _n, _f))
-cam.data.clip_start = _n
-cam.data.clip_end = _f
-NEAR, FAR = _n, _f
+    # 收紧裁剪面：深度图把 [near, far] 线性映射到 [1,0]，far 太大就没精度
+    _n, _f = scene_depth_range()
+    say("裁剪面: 原 near=%.4g far=%.4g  ->  导出用 near=%.4g far=%.4g" % (
+        _state["clip_start"], _state["clip_end"], _n, _f))
+    cam.data.clip_start = _n
+    cam.data.clip_end = _f
+    NEAR, FAR = _n, _f
 
-scene.render.resolution_x = W
-scene.render.resolution_y = H
-scene.render.resolution_percentage = 100
-scene.render.use_compositing = False
-scene.render.film_transparent = False
-scene.view_settings.view_transform = 'Standard'
-scene.view_settings.look = 'None'
-scene.view_settings.exposure = 0.0
-scene.view_settings.gamma = 1.0
+    scene.render.resolution_x = W
+    scene.render.resolution_y = H
+    scene.render.resolution_percentage = 100
+    scene.render.use_compositing = False
+    scene.render.film_transparent = False
+    scene.view_settings.view_transform = 'Standard'
+    scene.view_settings.look = 'None'
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
 
-# ---- 1) 彩模 ----
-p_comb = os.path.join(OUT_DIR, "%s_combined.png" % NAME)
-shoot(p_comb, "PNG", "8", override=None)
-say("[1] 彩模   -> %s" % p_comb)
+    # ---- 1) 彩模 ----
+    p_comb = os.path.join(OUT_DIR, "%s_combined.png" % NAME)
+    shoot(p_comb, "PNG", "8", override=None)
+    say("[1] 彩模   -> %s" % p_comb)
 
-# ---- 2) 灰模 ----
-scene.render.engine = 'BLENDER_WORKBENCH'
-sh = scene.display.shading
-sh.light = 'STUDIO'
-sh.color_type = 'SINGLE'
-sh.single_color = (0.55, 0.55, 0.55)
-sh.show_shadows = True
-sh.show_cavity = True
-sh.cavity_type = 'BOTH'
-sh.background_type = 'WORLD'
-p_clay = os.path.join(OUT_DIR, "%s_clay.png" % NAME)
-scene.render.image_settings.file_format = 'PNG'
-scene.render.image_settings.color_mode = 'RGB'
-scene.render.image_settings.color_depth = '8'
-scene.render.filepath = p_clay
-bpy.ops.render.render(write_still=True)
-say("[2] 灰模   -> %s" % p_clay)
+    # ---- 2) 灰模 ----
+    scene.render.engine = 'BLENDER_WORKBENCH'
+    sh = scene.display.shading
+    sh.light = 'STUDIO'
+    sh.color_type = 'SINGLE'
+    sh.single_color = (0.55, 0.55, 0.55)
+    sh.show_shadows = True
+    sh.show_cavity = True
+    sh.cavity_type = 'BOTH'
+    sh.background_type = 'WORLD'
+    p_clay = os.path.join(OUT_DIR, "%s_clay.png" % NAME)
+    scene.render.image_settings.file_format = 'PNG'
+    scene.render.image_settings.color_mode = 'RGB'
+    scene.render.image_settings.color_depth = '8'
+    scene.render.filepath = p_clay
+    bpy.ops.render.render(write_still=True)
+    say("[2] 灰模   -> %s" % p_clay)
 
-# ---- 3) 深度 EXR ----
-scene.render.engine = 'BLENDER_EEVEE'
-m_depth = mat_depth()
-p_dep = os.path.join(OUT_DIR, "%s_depth.exr" % NAME)
-shoot(p_dep, "OPEN_EXR", "32", override=m_depth)
-say("[3] 深度   -> %s" % p_dep)
+    # ---- 3) 深度 EXR ----
+    scene.render.engine = 'BLENDER_EEVEE'
+    m_depth = mat_depth()
+    p_dep = os.path.join(OUT_DIR, "%s_depth.exr" % NAME)
+    shoot(p_dep, "OPEN_EXR", "32", override=m_depth)
+    say("[3] 深度   -> %s" % p_dep)
 
-# ---- 4) 法线：两种 Z 约定各渲一张，用 ray_cast 真值判定 ----
-say("[4] 法线   -> 渲染两种 Z 约定，用 ray_cast 真值判定")
-samples = pick_pixels(220)
-say("    相机位置 %s  镜头 %.1fmm  传感器 %.1fmm  fit=%s" % (
-    tuple(round(v, 3) for v in cam.matrix_world.translation),
-    cam.data.lens, cam.data.sensor_width, cam.data.sensor_fit))
-_o0, _d0 = cam_ray(W // 2, H // 2)
-_axis = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
-say("    中心射线 %s  光轴 %s  余弦 %.6f" % (
-    tuple(round(v, 3) for v in _d0), tuple(round(v, 3) for v in _axis),
-    _d0.dot(_axis)))
-say("    命中像素样本: %d" % len(samples))
-depth_arr = load_px(p_dep)
-np.save(os.path.join(OUT_DIR, "%s_depth.npy" % NAME),
-        depth_arr.astype(np.float32))
+    # ---- 4) 法线：两种 Z 约定各渲一张，用 ray_cast 真值判定 ----
+    say("[4] 法线   -> 渲染两种 Z 约定，用 ray_cast 真值判定")
+    samples = pick_pixels(220)
+    say("    相机位置 %s  镜头 %.1fmm  传感器 %.1fmm  fit=%s" % (
+        tuple(round(v, 3) for v in cam.matrix_world.translation),
+        cam.data.lens, cam.data.sensor_width, cam.data.sensor_fit))
+    _o0, _d0 = cam_ray(W // 2, H // 2)
+    _axis = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+    say("    中心射线 %s  光轴 %s  余弦 %.6f" % (
+        tuple(round(v, 3) for v in _d0), tuple(round(v, 3) for v in _axis),
+        _d0.dot(_axis)))
+    say("    命中像素样本: %d" % len(samples))
+    depth_arr = load_px(p_dep)
+    np.save(os.path.join(OUT_DIR, "%s_depth.npy" % NAME),
+            depth_arr.astype(np.float32))
 
-norm_cand = {}
-for flip in (False, True):
-    p = os.path.join(OUT_DIR, "%s_normal%s.exr" %
-                     (NAME, "_flipZ" if flip else ""))
-    m = mat_normal(flip)
-    shoot(p, "OPEN_EXR", "32", override=m)
-    norm_cand[flip] = (p, load_px(p))
-
-
-def normal_truth(nw):
-    """相机空间法线真值：只用旋转部分（3x3），不能带平移。"""
-    return (cam_inv.to_3x3() @ Vector(nw)).normalized()
+    norm_cand = {}
+    for flip in (False, True):
+        p = os.path.join(OUT_DIR, "%s_normal%s.exr" %
+                         (NAME, "_flipZ" if flip else ""))
+        m = mat_normal(flip)
+        shoot(p, "OPEN_EXR", "32", override=m)
+        norm_cand[flip] = (p, load_px(p))
 
 
-# 分通道误差。**Z 通道**才是判别翻转的依据：
-# 用 max(|Δ|) 会让 X/Y 的误差盖住 Z，两种约定给出相同的数字。
-per_flip = {}
-for flip, (p, arr) in norm_cand.items():
-    ex, ey, ez = [], [], []
+    def normal_truth(nw):
+        """相机空间法线真值：只用旋转部分（3x3），不能带平移。"""
+        return (cam_inv.to_3x3() @ Vector(nw)).normalized()
+
+
+    # 分通道误差。**Z 通道**才是判别翻转的依据：
+    # 用 max(|Δ|) 会让 X/Y 的误差盖住 Z，两种约定给出相同的数字。
+    per_flip = {}
+    for flip, (p, arr) in norm_cand.items():
+        ex, ey, ez = [], [], []
+        for (px, py, loc, nrm) in samples:
+            v = read_px(arr, px, py)
+            if v is None:
+                continue
+            t = normal_truth(nrm)
+            ex.append(abs(float(v[0]) - (t.x * 0.5 + 0.5)))
+            ey.append(abs(float(v[1]) - (t.y * 0.5 + 0.5)))
+            ez.append(abs(float(v[2]) - (t.z * 0.5 + 0.5)))
+        per_flip[flip] = (ex, ey, ez)
+        say("    %-9s 样本 %d  |dx|=%.4f |dy|=%.4f |dz|=%.4f" % (
+            "flipZ" if flip else "no-flip", len(ex),
+            float(np.mean(ex)) if ex else -1,
+            float(np.mean(ey)) if ey else -1,
+            float(np.mean(ez)) if ez else -1))
+
+    best_flip = min(per_flip, key=lambda f: float(np.mean(per_flip[f][2])))
+    say("    => 采用: %s（按 Z 通道误差）" % ("flipZ" if best_flip else "no-flip"))
+    p_norm, norm_arr = norm_cand[best_flip]
+    final_norm = os.path.join(OUT_DIR, "%s_normal.exr" % NAME)
+    if p_norm != final_norm:
+        if os.path.exists(final_norm):
+            os.remove(final_norm)
+        os.rename(p_norm, final_norm)
+        norm_arr = load_px(final_norm)
+    np.save(os.path.join(OUT_DIR, "%s_normal.npy" % NAME),
+            norm_arr.astype(np.float32))
+    say("    法线   -> %s" % final_norm)
+
+    # ---- 5) 深度自检（ray_cast 真值）----
+    _hw, _hh = _cam_intrinsics()
+    derr, dfoot = [], []
     for (px, py, loc, nrm) in samples:
-        v = read_px(arr, px, py)
+        d = abs((cam_inv @ loc).z)
+        exp = 1.0 - (d - NEAR) / (FAR - NEAR)
+        v = read_px(depth_arr, px, py)
         if v is None:
             continue
-        t = normal_truth(nrm)
-        ex.append(abs(float(v[0]) - (t.x * 0.5 + 0.5)))
-        ey.append(abs(float(v[1]) - (t.y * 0.5 + 0.5)))
-        ez.append(abs(float(v[2]) - (t.z * 0.5 + 0.5)))
-    per_flip[flip] = (ex, ey, ez)
-    say("    %-9s 样本 %d  |dx|=%.4f |dy|=%.4f |dz|=%.4f" % (
-        "flipZ" if flip else "no-flip", len(ex),
-        float(np.mean(ex)) if ex else -1,
-        float(np.mean(ey)) if ey else -1,
-        float(np.mean(ez)) if ez else -1))
+        derr.append(abs(float(v[0]) - exp))
+        # 一个像素在物体上的世界尺寸（米）：掠射面上深度在**一个像素内**
+        # 就能变好几厘米，所以绝对误差必须换算成"像素数"才有意义。
+        dfoot.append(2.0 * _hh * d / float(H))
+    say("[5] 深度自检: 样本 %d" % len(derr))
+    if derr:
+        a = np.array(derr) * (FAR - NEAR)      # 换成米
+        f = np.array(dfoot)
+        say("    绝对误差: 中位 %.4f m  P90 %.4f m  最大 %.4f m" % (
+            float(np.median(a)), float(np.percentile(a, 90)), float(a.max())))
+        ratio = a / np.maximum(f, 1e-9)
+        say("    折合像素: 中位 %.2f px  P90 %.2f px  最大 %.2f px" % (
+            float(np.median(ratio)), float(np.percentile(ratio, 90)),
+            float(ratio.max())))
+        say("    像素足迹: 中位 %.4f m（这就是能分辨的最小深度差）" % (
+            float(np.median(f))))
+        say("    合格率(|误差| < 1 个像素足迹): %.1f%%" % (
+            100.0 * float((ratio < 1.0).mean())))
 
-best_flip = min(per_flip, key=lambda f: float(np.mean(per_flip[f][2])))
-say("    => 采用: %s（按 Z 通道误差）" % ("flipZ" if best_flip else "no-flip"))
-p_norm, norm_arr = norm_cand[best_flip]
-final_norm = os.path.join(OUT_DIR, "%s_normal.exr" % NAME)
-if p_norm != final_norm:
-    if os.path.exists(final_norm):
-        os.remove(final_norm)
-    os.rename(p_norm, final_norm)
-    norm_arr = load_px(final_norm)
-np.save(os.path.join(OUT_DIR, "%s_normal.npy" % NAME),
-        norm_arr.astype(np.float32))
-say("    法线   -> %s" % final_norm)
+    # 法线最终误差（按选定约定）
+    ex, ey, ez = per_flip[best_flip]
+    if ez:
+        say("[5b] 法线自检(选定约定): |dx|=%.4f |dy|=%.4f |dz|=%.4f" % (
+            float(np.mean(ex)), float(np.mean(ey)), float(np.mean(ez))))
 
-# ---- 5) 深度自检（ray_cast 真值）----
-_hw, _hh = _cam_intrinsics()
-derr, dfoot = [], []
-for (px, py, loc, nrm) in samples:
-    d = abs((cam_inv @ loc).z)
-    exp = 1.0 - (d - NEAR) / (FAR - NEAR)
-    v = read_px(depth_arr, px, py)
-    if v is None:
-        continue
-    derr.append(abs(float(v[0]) - exp))
-    # 一个像素在物体上的世界尺寸（米）：掠射面上深度在**一个像素内**
-    # 就能变好几厘米，所以绝对误差必须换算成"像素数"才有意义。
-    dfoot.append(2.0 * _hh * d / float(H))
-say("[5] 深度自检: 样本 %d" % len(derr))
-if derr:
-    a = np.array(derr) * (FAR - NEAR)      # 换成米
-    f = np.array(dfoot)
-    say("    绝对误差: 中位 %.4f m  P90 %.4f m  最大 %.4f m" % (
-        float(np.median(a)), float(np.percentile(a, 90)), float(a.max())))
-    ratio = a / np.maximum(f, 1e-9)
-    say("    折合像素: 中位 %.2f px  P90 %.2f px  最大 %.2f px" % (
-        float(np.median(ratio)), float(np.percentile(ratio, 90)),
-        float(ratio.max())))
-    say("    像素足迹: 中位 %.4f m（这就是能分辨的最小深度差）" % (
-        float(np.median(f))))
-    say("    合格率(|误差| < 1 个像素足迹): %.1f%%" % (
-        100.0 * float((ratio < 1.0).mean())))
+    # ---- 6) 清单 ----
+    manifest = {
+        "name": NAME,
+        "resolution": [W, H],
+        "engine": "BLENDER_EEVEE",
+        "near": NEAR,
+        "far": FAR,
+        "camera_matrix_world": [list(r) for r in cam.matrix_world],
+        "camera_inverse_3x3": [list(r) for r in cam_inv.to_3x3()],
+        "lens": cam.data.lens,
+        "sensor_width": cam.data.sensor_width,
+        "normal_convention": {
+            "space": "camera",
+            "encoding": "n * 0.5 + 0.5",
+            "flip_z": bool(best_flip),
+            "truth": "cam_inv.to_3x3() @ n_world  (3x3 rotation only)",
+        },
+        "depth_convention": {
+            "raw": "Camera Data -> View Z Depth (metres, positive)",
+            "stored": "linear, remapped near->1, far->0",
+            "metres_from_value": "(1 - v) * (far - near) + near",
+        },
+        "files": {
+            "combined": os.path.basename(p_comb),
+            "clay": os.path.basename(p_clay),
+            "depth_exr": os.path.basename(p_dep),
+            "depth_npy": "%s_depth.npy" % NAME,
+            "normal_exr": os.path.basename(final_norm),
+            "normal_npy": "%s_normal.npy" % NAME,
+        },
+    }
+    mpath = os.path.join(OUT_DIR, "%s_manifest.json" % NAME)
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    say("[6] 清单   -> %s" % mpath)
 
-# 法线最终误差（按选定约定）
-ex, ey, ez = per_flip[best_flip]
-if ez:
-    say("[5b] 法线自检(选定约定): |dx|=%.4f |dy|=%.4f |dz|=%.4f" % (
-        float(np.mean(ex)), float(np.mean(ey)), float(np.mean(ez))))
+    # ---- 7) 还原场景 ----
+    say("    捕获时 override = %s" % _state["override"])
+    restore()
+    say("    还原后 override = %s" % bpy.context.view_layer.material_override)
+    bpy.context.view_layer.update()
+    with open(os.path.join(OUT_DIR, "%s_report.txt" % NAME), "w",
+              encoding="utf-8") as f:
+        f.write("\n".join(report))
 
-# ---- 6) 清单 ----
-manifest = {
-    "name": NAME,
-    "resolution": [W, H],
-    "engine": "BLENDER_EEVEE",
-    "near": NEAR,
-    "far": FAR,
-    "camera_matrix_world": [list(r) for r in cam.matrix_world],
-    "camera_inverse_3x3": [list(r) for r in cam_inv.to_3x3()],
-    "lens": cam.data.lens,
-    "sensor_width": cam.data.sensor_width,
-    "normal_convention": {
-        "space": "camera",
-        "encoding": "n * 0.5 + 0.5",
-        "flip_z": bool(best_flip),
-        "truth": "cam_inv.to_3x3() @ n_world  (3x3 rotation only)",
-    },
-    "depth_convention": {
-        "raw": "Camera Data -> View Z Depth (metres, positive)",
-        "stored": "linear, remapped near->1, far->0",
-        "metres_from_value": "(1 - v) * (far - near) + near",
-    },
-    "files": {
-        "combined": os.path.basename(p_comb),
-        "clay": os.path.basename(p_clay),
-        "depth_exr": os.path.basename(p_dep),
-        "depth_npy": "%s_depth.npy" % NAME,
-        "normal_exr": os.path.basename(final_norm),
-        "normal_npy": "%s_normal.npy" % NAME,
-    },
-}
-mpath = os.path.join(OUT_DIR, "%s_manifest.json" % NAME)
-with open(mpath, "w", encoding="utf-8") as f:
-    json.dump(manifest, f, ensure_ascii=False, indent=2)
-say("[6] 清单   -> %s" % mpath)
+    say("[7] 场景已还原（渲染引擎/材质覆盖/视图变换/着色器均已复位）")
+    say("EXPORT DONE")
 
-# ---- 7) 还原场景 ----
-restore()
-bpy.context.view_layer.update()
-with open(os.path.join(OUT_DIR, "%s_report.txt" % NAME), "w",
-          encoding="utf-8") as f:
-    f.write("\n".join(report))
 
-say("[7] 场景已还原（渲染引擎/材质覆盖/视图变换/着色器均已复位）")
-say("EXPORT DONE")
+def _cleanup_export_materials():
+    """删掉本次导出建的临时材质（还原后已无用户）。"""
+    for m in list(bpy.data.materials):
+        if m.name.startswith("EXPORT_") and m.users == 0:
+            bpy.data.materials.remove(m)
+
+
+try:
+    main()
+except Exception:
+    import traceback
+    traceback.print_exc()
+    raise
+finally:
+    restore()
+    _cleanup_export_materials()
+    bpy.context.view_layer.update()
+    print("[7] 场景已还原（渲染引擎/材质覆盖/视图变换/着色器/相机裁剪面均已复位）")
