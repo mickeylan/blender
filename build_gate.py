@@ -47,7 +47,10 @@ box('Base_Cap', (BW - 0.06, BD - 0.06, 0.22), (0, 0, BH - 0.11), None, stone)
 bevel(bpy.data.objects['Base_Cap'], 0.03)
 
 # ---------- 两层楼阁 ----------
-def tier(idx, z0, h, rooffoot_w, rooffoot_d, ridge_h):
+DG_KOU = 0.085
+DG_H = 12.3 * DG_KOU          # 单朵斗拱总高（12.3 倍斗口）
+
+def tier(idx, z0, h, rooffoot_w, rooffoot_d, rise):
     # 柱
     cols = []
     for sx in (-1, 1):
@@ -57,7 +60,11 @@ def tier(idx, z0, h, rooffoot_w, rooffoot_d, ridge_h):
             cyl('T%d_Col_%d%d' % (idx, sx > 0, sy > 0), 0.13, h,
                 (x, y, z0 + h * 0.5), None, 16, wood)
             cols.append((x, y))
-    # 额枋（柱头连梁）
+    # 柱头斗拱（宋代五铺作单朵）——评审明确要求"T1 屋面缺少可辨识的斗拱"
+    for i, (x, y) in enumerate(cols):
+        dougong('T%d_DG_%d' % (idx, i), z=z0 + h, kou=DG_KOU,
+                material=wood, x=x, y=y)
+    # 额枋（柱头连梁，架在栌斗底）
     yf = rooffoot_d * 0.5 - 0.35
     xf = rooffoot_w * 0.5 - 0.45
     beam('T%d_Fang_F' % idx, (-xf, -yf, z0 + h), (xf, -yf, z0 + h), 0.16, wood)
@@ -72,24 +79,28 @@ def tier(idx, z0, h, rooffoot_w, rooffoot_d, ridge_h):
         beam('T%d_Rail_B%d' % (idx, int(zz * 100)), (-rx, ry, zz), (rx, ry, zz), th, rail)
         beam('T%d_Rail_L%d' % (idx, int(zz * 100)), (-rx, -ry, zz), (-rx, ry, zz), th, rail)
         beam('T%d_Rail_R%d' % (idx, int(zz * 100)), (rx, -ry, zz), (rx, ry, zz), th, rail)
-    # 反曲屋顶：起翘按"举高"的比例给，不要按绝对高度给
-    rise = ridge_h - (z0 + h)
+    # 反曲屋顶：檐口在**撩檐枋之上**（斗拱高 1.05m，檐口不抬上去斗拱会穿出屋面）
+    eave_z = z0 + h + DG_H
     roof = curved_roof('T%d_Roof' % idx, rooffoot_w, rooffoot_d,
-                       ridge_h=ridge_h, eave_h=z0 + h,
+                       ridge_h=eave_z + rise, eave_h=eave_z,
                        overhang=0.55, corner_lift=rise * 0.55,
-                       curve=2.4, material=tile, ridge_mat=ridgeW)
-    return roof
+                       curve=2.4, material=tile, ridge_mat=ridgeW,
+                       # LESSONS [042]：加瓦垄让反宇曲率可见
+                       tile_ridges=int(rooffoot_w / 0.32),
+                       tile_w=0.32, tile_h=0.05)
+    return roof, eave_z
 
 T1_Z = BH
 T1_H = 2.5
 # 一层屋顶必须**出挑到基座之外**（基座 8.0 宽 -> 屋顶 7.6+1.1=8.7 宽）。
 # 独立评审 kimi-k2.5 指出"屋檐比基座窄"是真实缺陷，已核实并修正。
-r1 = tier(1, T1_Z, T1_H, 7.6, 3.9, ridge_h=T1_Z + T1_H + 1.75)
+r1, T1_EAVE = tier(1, T1_Z, T1_H, 7.6, 3.9, rise=1.75)
 
-T2_Z = T1_Z + T1_H + 0.05
+# 二层落在**一层屋檐之上**（重檐城楼）
+T2_Z = T1_EAVE + 0.10
 T2_H = 2.5
 # 二层按一层屋面收分
-r2 = tier(2, T2_Z, T2_H, 5.4, 2.9, ridge_h=T2_Z + T2_H + 1.45)
+r2, T2_EAVE = tier(2, T2_Z, T2_H, 5.4, 2.9, rise=1.45)
 
 area_light('KeyFill', (-8, -11, 9), 420, 12, (0, 0, 4))
 stats('CITY GATE ')

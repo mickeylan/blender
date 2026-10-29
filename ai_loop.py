@@ -69,6 +69,29 @@ import bpy, math, bmesh
 from mathutils import Vector, Matrix, Euler
 
 def clear_scene():
+    """清场。增量模式下只删保留集合之外的构件。
+
+    _KEEP 由 harness 在 PRELUDE **之前**注入（见 Session.run）。
+    这里用 globals().get 取，**不要**在 PRELUDE 里写 _KEEP = None ——
+    那会把注入值冲掉（实测踩过：注入被覆盖，增量模式退化成全量清场）。
+    """
+    keep = globals().get("_KEEP", None)
+    if keep is not None:
+        keep = list(keep)
+
+        def _kept(n):
+            return any(n == k or n.startswith(k) for k in keep)
+
+        for o in list(bpy.data.objects):
+            if _kept(o.name):
+                continue
+            bpy.data.objects.remove(o, do_unlink=True)
+        # 集合：只删空的
+        for c in list(bpy.data.collections):
+            if not c.objects and not c.children:
+                bpy.data.collections.remove(c)
+        print("CLEAR_PARTIAL kept=%d" % len(keep))
+        return
     for o in list(bpy.data.objects):
         bpy.data.objects.remove(o, do_unlink=True)
     for c in list(bpy.data.collections):
@@ -305,11 +328,534 @@ def coll(name):
     bpy.context.scene.collection.children.link(c)
     return c
 
+# ================= 形制助手：宋代斗拱 =================
+# LESSONS [044]：评审反复要求"T1 屋面缺少可辨识的斗拱结构"——
+# 模型自由发挥做不出斗拱（层数/出跳/斗块全靠猜）。
+# 把"五铺作单朵斗拱"编码成参数，模型只需给斗口 kou 与位置。
+#
+# 层级（自下而上），k = 斗口模数：
+#   0  栌斗        十字形基座，落在柱头
+#   1  华栱(第一跳) 十字出跳 4k，4 个交互斗
+#   2  泥道栱      沿 x 连到两端交互斗
+#   3  令栱(第二跳) 再出跳，散斗
+#   4  下昂        斜挑出檐外 + 蚂蚱头
+#   5  撩檐枋      顶部承檩
+#
+# 形制细节（宋式区别于清式的关键）：
+#   卷杀 —— 栱的**底面是一道曲线**，向两端翘起，不是直棱方木
+#   斗欹 —— 斗块**底部收分**（下小上大），不是直立方块
+# 视觉评审实测点名的缺失项正是这两条（LESSONS [044]）。
+
+def _mesh_object(name, verts, faces, material=None, coll_target=None):
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.update()
+    ob = _link(bpy.data.objects.new(name, me))
+    if material is not None:
+        me.materials.append(material)
+    if coll_target is not None:
+        coll_target.objects.link(ob)
+    return ob
+
+
+def _juan_sha_gong(name, span, width, height, loc=(0, 0, 0), axis='X',
+                   material=None, coll_target=None, taper=0.45):
+    """带**卷杀**的栱（华栱/令栱）。
+
+    底面沿长度方向是一道上翘的曲线（宋式「卷杀」），
+    顶面平直，两端收薄。清式斗拱的栱是直棱的，
+    这条曲线正是区分宋清的最直观特征。
+    """
+    N = 12
+    V, F = [], []
+    for i in range(N + 1):
+        u = i / N
+        x = -span * 0.5 + u * span
+        t = min(u, 1.0 - u) * 2.0            # 0=中心 1=两端
+        bot = height * (1.0 - taper * (t ** 1.7))
+        V.extend([
+            (x, -width * 0.5, bot), (x, width * 0.5, bot),
+            (x, width * 0.5, height), (x, -width * 0.5, height),
+        ])
+    for i in range(N):
+        a = i * 4
+        b = (i + 1) * 4
+        for k in range(4):
+            k2 = (k + 1) % 4
+            F.append((a + k, a + k2, b + k2, b + k))
+    # 两端封口
+    F.append((0, 3, 2, 1))
+    F.append((N * 4, N * 4 + 1, N * 4 + 2, N * 4 + 3))
+    ob = _mesh_object(name, V, F, material, coll_target)
+    ob.location = loc
+    if axis == 'Y':
+        ob.rotation_euler = (0.0, 0.0, math.radians(90.0))
+    return ob
+
+
+def _dou_block(name, w, d, h, loc=(0, 0, 0), material=None, coll_target=None,
+               neck=0.70):
+    """带**斗欹**的斗块（散斗/交互斗）。
+
+    底部按 neck 比例收分，到 1/3 高处再放大到全尺寸，
+    形成宋式斗块特有的「下小上大」束腰。
+    """
+    V = []
+    hw, hd = w * 0.5, d * 0.5
+    nw, nd = hw * neck, hd * neck
+    z1 = h * 0.34
+    # 底环（收分）
+    V.extend([(-nw, -nd, 0), (nw, -nd, 0), (nw, nd, 0), (-nw, nd, 0)])
+    # 中环（全尺寸）
+    V.extend([(-hw, -hd, z1), (hw, -hd, z1), (hw, hd, z1), (-hw, hd, z1)])
+    # 顶环（全尺寸）
+    V.extend([(-hw, -hd, h), (hw, -hd, h), (hw, hd, h), (-hw, hd, h)])
+    F = [(3, 2, 1, 0)]
+    for ring in (0, 1):
+        a, b = ring * 4, (ring + 1) * 4
+        for k in range(4):
+            k2 = (k + 1) % 4
+            F.append((a + k, a + k2, b + k2, b + k))
+    F.append((8, 9, 10, 11))
+    ob = _mesh_object(name, V, F, material, coll_target)
+    ob.location = loc
+    return ob
+
+def dougong(name, z=0.0, kou=0.10, material=None, coll_target=None,
+            x=0.0, y=0.0):
+    """宋代五铺作斗拱（单朵），坐落在柱头上。
+
+    kou : 斗口（模数，米）。所有构件尺寸按斗口倍数推算。
+    z   : 栌斗底面高度（应等于柱头高度）
+    x,y : 这朵斗拱在平面上的位置（柱心）
+    返回：构件名列表（便于 stats 分组统计）
+
+    宋式特点（与清式最大的区别）：**出跳少、构件简洁、昂修长**。
+    """
+    k = float(kou)
+    M = material
+    made = []
+    bx, by = float(x), float(y)
+
+    def mk(part, size, loc, rot=(0.0, 0.0, 0.0)):
+        ob = box("%s_%s" % (name, part), size,
+                 (loc[0] + bx, loc[1] + by, loc[2]), rot, M, coll_target)
+        made.append(ob.name)
+        return ob
+
+    def mk_gong(part, span, width, height, loc, axis):
+        ob = _juan_sha_gong("%s_%s" % (name, part), span, width, height,
+                             (loc[0] + bx, loc[1] + by, loc[2]), axis,
+                             M, coll_target)
+        made.append(ob.name)
+        return ob
+
+    def mk_dou(part, w, d, h, loc):
+        ob = _dou_block("%s_%s" % (name, part), w, d, h,
+                        (loc[0] + bx, loc[1] + by, loc[2]), M, coll_target)
+        made.append(ob.name)
+        return ob
+
+    # ---- 0 栌斗：十字形基座（两个盒子交叉，十字臂 3.4k）----
+    mk("Lutou_X", (3.4 * k, 1.9 * k, 2.0 * k), (0, 0, z + 1.0 * k))
+    mk("Lutou_Y", (1.9 * k, 3.4 * k, 2.0 * k), (0, 0, z + 1.0 * k))
+
+    # ---- 1 华栱（第一跳）：十字向外出跳 4k（带卷杀）----
+    z1 = z + 2.0 * k
+    mk_gong("HuaGong_X", 8.0 * k, 1.6 * k, 1.6 * k, (0, 0, z1), 'X')
+    mk_gong("HuaGong_Y", 8.0 * k, 1.6 * k, 1.6 * k, (0, 0, z1), 'Y')
+
+    # ---- 交互斗：华栱 4 个出挑端顶上的十字斗（带斗欹）----
+    z2 = z1 + 1.6 * k
+    for sx in (-1, 1):
+        mk_dou("JiaoDouX%d" % (sx > 0), 1.9 * k, 1.9 * k, 1.5 * k,
+               (sx * 4.0 * k, 0, z2))
+    for sy in (-1, 1):
+        mk_dou("JiaoDouY%d" % (sy > 0), 1.9 * k, 1.9 * k, 1.5 * k,
+               (0, sy * 4.0 * k, z2))
+
+    # ---- 2 泥道栱：沿 x 架在两端交互斗上 ----
+    z3 = z2 + 1.5 * k
+    mk_gong("NiDaoGong", 9.6 * k, 1.5 * k, 1.5 * k, (0, 0, z3), 'X')
+
+    # ---- 散斗：泥道栱两端 ----
+    z4 = z3 + 1.5 * k
+    for sx in (-1, 1):
+        mk_dou("SanDouX%d" % (sx > 0), 1.8 * k, 1.8 * k, 1.4 * k,
+               (sx * 4.0 * k, 0, z4))
+
+    # ---- 3 令栱（第二跳）：沿 x 再出跳到 5.6k，另沿 y 出跳 ----
+    z5 = z4 + 1.4 * k
+    mk_gong("LingGong_X", 11.2 * k, 1.4 * k, 1.4 * k, (0, 0, z5), 'X')
+    mk_gong("LingGong_Y", 9.6 * k, 1.4 * k, 1.4 * k, (0, 0, z5), 'Y')
+
+    # ---- 散斗：令栱外端 ----
+    z6 = z5 + 1.4 * k
+    for sx in (-1, 1):
+        mk_dou("SanDou2X%d" % (sx > 0), 1.8 * k, 1.8 * k, 1.4 * k,
+               (sx * 5.6 * k, 0, z6))
+    for sy in (-1, 1):
+        mk_dou("SanDou2Y%d" % (sy > 0), 1.8 * k, 1.8 * k, 1.4 * k,
+               (0, sy * 4.8 * k, z6))
+
+    # ---- 4 下昂：从泥道栱层斜挑出檐外（宋式昂修长）----
+    # 昂身自中心向外斜上，至端部再以蚂蚱头斜收。
+    for sy in (-1, 1):
+        p0 = (0.0, sy * 0.6 * k, z4 - 0.3 * k)
+        p1 = (0.0, sy * 6.6 * k, z6 + 0.5 * k)
+        beam("%s_Ang%d" % (name, sy > 0), p0, p1, 1.3 * k, M)
+        made.append("%s_Ang%d" % (name, sy > 0))
+        # 蚂蚱头：昂端斜垫块（三角感用旋转盒近似）
+        mk("MaZhaTou%d" % (sy > 0), (1.3 * k, 1.9 * k, 1.1 * k),
+           (0, sy * 7.0 * k, z6 + 1.0 * k), (math.radians(22 * sy), 0, 0))
+
+    # ---- 5 撩檐枋：顶部承檩的横枋 ----
+    z7 = z6 + 1.4 * k
+    mk("LiaoYanFang", (12.6 * k, 1.5 * k, 1.5 * k), (0, 0, z7 + 0.75 * k))
+
+    print("DOUGONG %s 构件数=%d 斗口=%.3fm 总高=%.2fm" % (
+        name, len(made), k, z7 + 1.5 * k - z))
+    return made
+
+# ================= 形制助手：贯木拱虹桥 =================
+# LESSONS [048]：《清明上河图》最著名的建筑是虹桥。
+#
+# 形制依据（唐寰澄 1953 年首次科学认定 + 后续研究）：
+#   - 名称："编木拱 / 贯木拱 / 叠梁拱"
+#   - 《东京梦华录》："其桥无柱，皆以巨木虚架，饰以丹艧，宛如飞虹"
+#   - **主体结构由两组拱骨系统交错搭置，通过横梁贯穿联合而成**，
+#     中间无榫无钉，靠木料相互**别压咬合**承重
+#   - 推算尺寸：净跨约 20m，**拱矢约 5m**，宽约 8m
+#   - 后世木拱廊桥（福建屏南万安桥、浙江云和梅崇桥）为其"活态"遗存：
+#     一级受力系统 = **三节苗**（3 段实木），
+#     二级受力系统 = **五节苗**（5 段实木），
+#     两套系统**穿插别压**，接头称"大小牛头"，以榫卯咬合
+#
+# 早前错误版本：把桥做成"三组平行梁"。
+# 视觉评审一致判"梁表现为平行的直线木梁，三维结构不明确"，
+# 根因正是**没有第二套系统**，因此无从"交错搭置"。
+#
+def hongqiao(name, span=20.0, width=8.0, rise=5.0, beam_r=0.34,
+             ribs=4, deck_th=0.18, post_h=0.55, rail_h=1.10, z=0.0,
+             weave_amp=1.25, material=None, plank_mat=None, rail_mat=None,
+             mat_a=None, mat_b=None, mat_miao=None, coll_target=None):
+    """贯木拱虹桥（编木拱 / 叠梁拱）。
+
+    span      : 净跨（两岸桥台之间的水平距离），唐寰澄推算约 20m
+    width     : 桥面宽，推算约 8m
+    rise      : 拱矢（拱背中部相对两岸抬高），推算约 5m
+    beam_r    : 拱肋圆木的截面半径
+    ribs      : 横向并列的拱肋**对**数（每对 = 三节苗 + 五节苗两套系统）
+    post_h    : 拱背与桥面之间的撑木高度
+    weave_amp : 二级（五节苗）系统相对一级（三节苗）折线的**交替偏离量**。
+                这就是"穿插别压"的编织幅度：越大，X 形交叉越明显。
+    z         : 两岸桥台顶（梁端搭放处）的高度
+
+    返回构件名列表。
+    """
+    M = material
+    made = []
+
+    def mkbox(part, size, loc, rot=(0.0, 0.0, 0.0), mat=None):
+        ob = box("%s_%s" % (name, part), size, loc, rot,
+                 mat if mat is not None else M, coll_target)
+        made.append(ob.name)
+        return ob
+
+    def mkcyl(part, radius, depth, loc, rot=(0.0, 0.0, 0.0), verts=16,
+              mat=None):
+        ob = cyl("%s_%s" % (name, part), radius, depth, loc, rot, verts,
+                 mat if mat is not None else M, coll_target)
+        made.append(ob.name)
+        return ob
+
+    half = span * 0.5
+    z_end = z + beam_r * 0.35
+    z_top = z + rise
+
+    # ---- 两套拱骨系统：**三节苗**（一级受力）与 **五节苗**（二级受力）----
+    # 权威依据（福建屏南万安桥 / 浙江云和梅崇桥，"活态虹桥"）：
+    #   "拱架系统由两套系统构成：最下方由三段实木搭建的'三节苗'构成了一级
+    #    受力系统，由五段实木组成的'五节苗'与其穿插别压，构成了二级受力系统。"
+    #
+    # **关键在于两套系统的节苗数不同（3 段 vs 5 段）**：
+    # 节点因此互相错开，二级（五节苗）的节点交替落在
+    # 一级（三节苗）折线的上��与下方 —— 于是两套梁**反复上下交替**，
+    # 侧立面上就是连续的 X 形交叉，也就是"穿插别压"。
+    #
+    # 早前版本两套系统都用 3 段、只做纵向平移，结果永远平行，
+    # 视觉评审实测判"结构为平行的双层木梁，缺少编织网架的交错咬合"。
+    def poly_eval(pts, x):
+        """折线求值：给定 x，返回 z。"""
+        if x <= pts[0][0]:
+            return pts[0][1]
+        for i in range(len(pts) - 1):
+            x0, z0 = pts[i]
+            x1, z1 = pts[i + 1]
+            if x0 <= x <= x1:
+                w = (x - x0) / max(1e-6, (x1 - x0))
+                return z0 + (z1 - z0) * w
+        return pts[-1][1]
+
+    # 一级系统：三节苗（4 节点 = 3 段）
+    _u3 = (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
+    A_pts = [(-half + uu * span, z_end if i in (0, 3) else z_top)
+             for i, uu in enumerate(_u3)]
+
+    # 二级系统：五节苗（6 节点 = 5 段），节点在 u = 0.2/0.4/0.6/0.8，
+    # 高度相对一级折线**交替** 上下偏离 weave_amp —— 这就是编织的来源。
+    _u5 = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    B_pts = []
+    for i, uu in enumerate(_u5):
+        x = -half + uu * span
+        if i in (0, len(_u5) - 1):
+            B_pts.append((x, z_end))
+        else:
+            base = poly_eval(A_pts, x)
+            # i=1 上, i=2 下, i=3 上, i=4 下 —— 交替
+            sgn = +1.0 if (i % 2 == 1) else -1.0
+            B_pts.append((x, base + sgn * weave_amp))
+
+    # ---- 逐肋对：两套系统横向错开 ----
+    # 横向间距必须 **> 两个梁半径之和**，否则两套系统在交叉处互相穿插，
+    # 渲染上糊成一根，"一根压住另一根"完全看不出来
+    # （实测视觉评审："两根纵梁在相交处呈现平顺的交叉，
+    #   未形成直接的互相咬合搭接"）。
+    dw = beam_r * 2.15
+    pair_w = width / ribs
+    # 三套体系用**不同木色**区分 —— 同色同调时几十根叠在一起的圆木
+    # 在渲染里糊成一片，编织关系完全读不出来（实测踩过：
+    # 视觉评审连续判"呈现为普通三角桁架，未能展示两套系统交织的咬合"）。
+    # 这也是古建测绘图区分结构体系的做法。
+    _mat_ab = {"A": mat_a if mat_a is not None else M,
+               "B": mat_b if mat_b is not None else M}
+    for i in range(ribs):
+        yc = -width * 0.5 + pair_w * (i + 0.5)
+        for tag, pts, sgn in (("A", A_pts, -1.0), ("B", B_pts, +1.0)):
+            y = yc + sgn * dw * 0.5
+            mtag = _mat_ab[tag]
+            for s in range(len(pts) - 1):
+                a = Vector((pts[s][0], y, pts[s][1]))
+                b = Vector((pts[s + 1][0], y, pts[s + 1][1]))
+                d = b - a
+                ob = mkcyl("R%d%s_S%d" % (i, tag, s), beam_r, d.length * 1.01,
+                           tuple((a + b) * 0.5), mat=mtag)
+                ob.rotation_mode = 'QUATERNION'
+                ob.rotation_quaternion = d.to_track_quat('Z', 'Y')
+                made[-1] = ob.name
+            # 节点处的"大小牛头"—— 榫卯咬合处加厚（无榫无钉，靠别压）
+            # 评审实测点名"缺少节点绑扎细节（短柱与横梁的连接）"，
+            # 故此处加：加厚的节点木 + 穿过节点的短横木 + 麻绳箍。
+            # 节点必须**看得出是接头**：评审实测原话
+            # "拱肋为长弧形直木，非短段折线木"——
+            # 接头不显眼，两根短木就看成了一根长弧木。
+            # 故牛头加粗加长，并另加一道更粗的麻绳箍。
+            for s in range(1, len(pts) - 1):
+                px, pz = pts[s]
+                mkcyl("R%d%s_Joint%d" % (i, tag, s), beam_r * 1.45,
+                      beam_r * 1.45, (px, y, pz), mat=mtag)
+                # 麻绳箍：套在接头处，比牛头更粗
+                mkcyl("R%d%s_Rope%d" % (i, tag, s), beam_r * 1.62,
+                      beam_r * 0.30, (px, y, pz),
+                      mat=(mat_miao if mat_miao is not None else M))
+                # 短横木：沿 y 贯穿该节点，把这一对的 A/B 两系统别住
+                ob = mkbox("R%d%s_Tie%d" % (i, tag, s),
+                           (beam_r * 1.15, dw * 2.4, beam_r * 0.9),
+                           (px, yc, pz - beam_r * 0.15), mat=mtag)
+                made[-1] = ob.name
+
+    # ---- 拱背剖面（桥面与撑木跟随它）----
+    # 取两套系统的**包络**（max），否则桥面会压到二级（五节苗）系统上。
+    def profile(u):
+        u = max(0.0, min(1.0, u))
+        x = -half + u * span
+        return max(poly_eval(A_pts, x), poly_eval(B_pts, x))
+
+    # ---- 横向苗：与纵向拱肋交叉编织，形成立体的菱形网格 ----
+    # 这是《清明上河图》虹桥最醒目的形象特征 —— 从桥下仰望，
+    # 无数横木与纵梁交错成菱形网格。
+    #
+    # 关键：横向苗**不是垂直于桥轴的**，而是**斜跨**的
+    # （百科原文："巨木**纵横**相贯、交错搭置"）。
+    # 苗一旦斜跨，与纵向拱肋就构成明确的对角交叉，
+    # 网格才读得出"编织网架"；垂直的苗只会像一道道横档。
+    #
+    # 每道苗沿 y 方向横跨全桥，在**每一道纵向肋的所在位置**
+    # 交替地压上去 / 钻下去（篮式编织）。压的幅度必须 > 一个梁径，
+    # 否则两梁在交点互相穿插，看不出谁压谁。
+    cross_ys = []
+    for i in range(ribs):
+        yc = -width * 0.5 + pair_w * (i + 0.5)
+        for sgn in (-1.0, +1.0):
+            cross_ys.append(yc + sgn * dw * 0.5)
+    cross_ys.sort()
+
+    amp2 = beam_r * 2.6          # 压/钻的净空，必须大于一个梁径
+    n_cross = 11
+    skew = width * 0.78          # 苗的斜跨量：倾角 atan(0.78)≈38°，
+                                # 早前 0.34 只有 19°，看起来就是垂直的
+                                # （评审："横向苗木与桥轴线垂直，未体现斜跨"）
+    for k in range(n_cross):
+        # 相邻的苗**反向斜跨**（人字形）：
+        # 一来端头收得住（单向斜跨时末道苗会伸出桥外 5m），
+        # 二来相邻苗互相交叉，才形成真正的菱形网格，
+        # 而不是一片平行的横档。
+        sdir = +1.0 if (k % 2 == 0) else -1.0
+        uu = 0.12 + k * (0.76 / (n_cross - 1.0))
+        xc = -half + uu * span               # 苗的中点位置
+        x0 = xc - sdir * skew * 0.5          # 苗在 -y 侧的端点 x
+        # 苗的节点：沿 y 方向横跨全桥，在每一道纵向肋处交替上下
+        pts = []
+        for j, yy in enumerate(cross_ys):
+            t = (yy + width * 0.5) / width            # 0..1 沿桥宽
+            xx = x0 + t * sdir * skew
+            base = profile((xx + half) / span)
+            sgn = +1.0 if (j % 2 == 0) else -1.0
+            pts.append((xx, yy, base + sgn * amp2))
+        # 两端落在桥边
+        pts.insert(0, (x0, -width * 0.5,
+                       profile((x0 + half) / span) - beam_r * 0.2))
+        pts.append((x0 + sdir * skew, width * 0.5,
+                    profile((x0 + sdir * skew + half) / span) - beam_r * 0.2))
+        for s in range(len(pts) - 1):
+            a = Vector(pts[s])
+            b = Vector(pts[s + 1])
+            d = b - a
+            ob = mkcyl("Miao_%d_S%d" % (k, s), beam_r * 0.95, d.length * 1.02,
+                       tuple((a + b) * 0.5),
+                       mat=(mat_miao if mat_miao is not None else M))
+            ob.rotation_mode = 'QUATERNION'
+            ob.rotation_quaternion = d.to_track_quat('Z', 'Y')
+            made[-1] = ob.name
+            # 交叉点的"别压"记号：一小段加粗的短木，明确标出压/钻处
+            if 1 <= s < len(pts) - 1:
+                ob2 = mkcyl("Miao_%d_X%d" % (k, s), beam_r * 1.25,
+                            beam_r * 0.7, tuple(a),
+                            mat=(mat_miao if mat_miao is not None else M))
+                ob2.rotation_mode = 'QUATERNION'
+                ob2.rotation_quaternion = d.to_track_quat('Z', 'Y')
+                made[-1] = ob2.name
+
+    # ---- 横梁贯穿：把两套系统联合成整体 ----
+    # 百科原文："通过横梁贯穿联合而成"。横梁沿 y 方向贯穿整桥宽。
+    for k, uu in enumerate((0.16, 0.30, 0.44, 0.56, 0.70, 0.84)):
+        x = -half + uu * span
+        zz = profile(uu)
+        ob = mkbox("Tie_%d" % k, (0.22, width * 1.01, 0.22),
+                   (x, 0.0, zz - beam_r * 0.5))
+        made[-1] = ob.name
+
+    # ---- 桥面：横向铺板（一块块铺，板间留缝，看得出铺装纹理）----
+    # 评审实测点名"缺少桥面铺装纹理"。整块大板看着像塑料板。
+    # 桥面底必须高于**整段编织的最高点**（profile + weave_amp），
+    # 否则五节苗的上半段被桥面盖住，只剩下半段，
+    # 视觉上就成了"上下叠置"而不是"穿插别压"
+    # （实测 clear=1.31 > weave_amp=1.25 → 编织被吃掉）。
+    # 净空还要再留一个梁径，才能看清压在上方的那根。
+    # 桥面底 = 包络(profile) + clear。
+    # 早前误以为"编织被桥面遮住"—— 其实 profile 是两套系统的**包络**，
+    # 编织永远在包络之下，遮不住。真正的变量是**桥面与拱背之间的空隙**：
+    # 空隙大 → 视觉读成"上下叠置"（评审原话），空隙小 → 读成密实的木构整体。
+    # 真实的虹桥桥面是紧贴着木料铺的。
+    # clear 的下限由横向苗决定：苗要压过肋，峰值 = profile + amp2，
+    # 所以 clear 必须 > amp2 才不会把苗戳穿。
+    clear = amp2 + beam_r * 1.25
+    NS = 8
+    deck = []
+    for i in range(NS + 1):
+        u = i / NS
+        deck.append((-half + u * span, profile(u) + clear + deck_th * 0.5))
+
+    def deck_top(u):
+        u = max(0.0, min(1.0, u))
+        x = -half + u * span
+        for i in range(NS):
+            x0, z0 = deck[i]
+            x1, z1 = deck[i + 1]
+            if x0 <= x <= x1:
+                w = (x - x0) / max(1e-6, (x1 - x0))
+                return z0 + (z1 - z0) * w
+        return deck[-1][1]
+
+    n_plank = 46
+    plank_w = span / n_plank * 0.88
+    for i in range(n_plank):
+        u = i / (n_plank - 1.0)
+        x = -half + u * span
+        ua, ub = max(0.0, u - 0.004), min(1.0, u + 0.004)
+        ang = math.atan2(deck_top(ub) - deck_top(ua), (ub - ua) * span)
+        # 相邻板用不同木色，板缝才看得出来（评审两次点名"缺少铺装纹理"）
+        pm = plank_mat if (plank_mat is not None and i % 2 == 1) else M
+        ob = box("%s_Plank_%d" % (name, i), (plank_w, width, deck_th),
+                 (x, 0.0, deck_top(u)), (0.0, -math.degrees(ang), 0.0),
+                 pm, coll_target)
+        made.append(ob.name)
+
+    # ---- 腹架：斜撑（拱背与桥面之间）----
+    # 这层的取舍实测过三版，结论是**必须留**：
+    #   整齐的垂直撑木 -> "垂直支撑的三角形桁架"（太规整）
+    #   斜撑           -> "抬梁加斜撑框架"（读成常规木构）
+    #   完全删掉       -> "结构不完整、缺少支撑"（桥面像悬空）
+    # 折中：用**斜撑**但压低体量（半径 0.42 梁径），且不成阵列，
+    # 让它读作腹架而不读作主体结构。
+    for i in range(ribs):
+        yc = -width * 0.5 + pair_w * (i + 0.5)
+        for k in range(n_cross):
+            uu0 = (k + 0.6) / (n_cross + 0.2)
+            uu1 = (k + 1.6) / (n_cross + 0.2)
+            if uu1 > 1.0:
+                break
+            x0 = -half + uu0 * span
+            x1 = -half + uu1 * span
+            z0 = profile(uu0) + beam_r * 0.4
+            z1 = profile(uu1) + clear + deck_th * 0.2
+            d = Vector((x1 - x0, 0.0, z1 - z0))
+            ob = mkcyl("Brace_%d_%d" % (i, k), beam_r * 0.34, d.length,
+                       ((x0 + x1) * 0.5, yc, (z0 + z1) * 0.5),
+                       mat=(mat_miao if mat_miao is not None else M))
+            ob.rotation_mode = 'QUATERNION'
+            ob.rotation_quaternion = d.to_track_quat('Z', 'Y')
+            made[-1] = ob.name
+
+    # ---- 两岸桥台（石）----
+    for side in (-1, 1):
+        ob = mkbox("Abutment_%d" % side, (2.6, width + 1.2, 2.8),
+                   (side * (half + 1.1), 0.0, z + 2.8 * 0.5 - 1.5))
+        made[-1] = ob.name
+
+    # ---- 两侧栏杆：望柱 + 扶手 ----
+    for side in (-1, 1):
+        y = side * (width * 0.5 - 0.14)
+        n_p = 15
+        for i in range(n_p):
+            u = i / (n_p - 1.0)
+            x = -half + u * span
+            zz = profile(u) + clear + deck_th
+            mkbox("Post_%d_%d" % (side, i), (0.14, 0.14, rail_h),
+                  (x, y, zz + rail_h * 0.5))
+        for i in range(NS):
+            x0, z0 = deck[i]
+            x1, z1 = deck[i + 1]
+            seg_len = ((x1 - x0) ** 2 + (z1 - z0) ** 2) ** 0.5
+            ang = math.atan2(z1 - z0, x1 - x0)
+            mid = ((x0 + x1) * 0.5, (z0 + z1) * 0.5)
+            ob = mkbox("Rail_%d_%d" % (side, i),
+                       (seg_len * 1.02, 0.11, 0.11),
+                       (mid[0], y, mid[1] + rail_h),
+                       (0.0, -math.degrees(ang), 0.0))
+            made[-1] = ob.name
+
+    print("HONGQIAO %s 构件数=%d 净跨=%.1fm 宽=%.1fm 拱矢=%.2fm "
+          "肋对=%d 编织幅度=%.2fm（三节苗x3 / 五节苗x5）" % (
+              name, len(made), span, width, rise, ribs, weave_amp))
+    return made
+
 # ================= 形制助手：反曲屋顶 =================
 # LESSONS [025]：模型做不出反曲屋顶，只会做平板或悬浮条。
 # 把"庑殿顶 + 反宇 + 起翘"编码成参数，模型只需给尺寸。
 def curved_roof(name, width, depth, ridge_h=2.2, eave_h=0.0, overhang=0.55,
                 corner_lift=0.9, curve=2.4, material=None, ridge_mat=None,
+                tile_ridges=0, tile_w=0.30, tile_h=0.045,
                 coll_target=None):
     """庑殿顶（四坡）反曲屋顶 —— 凹曲屋面 + 起翘檐角。
 
@@ -324,6 +870,13 @@ def curved_roof(name, width, depth, ridge_h=2.2, eave_h=0.0, overhang=0.55,
     overhang    : 出檐外挑
     corner_lift : 檐角起翘量（绝对长度，内部会按屋脊高度比例钳制）
     curve       : 反宇程度，>1 越大越凹
+    tile_ridges : 瓦垄条数（0 = 不加）。LESSONS [042]：光有曲面时，
+                  反宇曲率在渲染图上**读不出来**（两个评审一致说"像平直斜面"），
+                  因为眼睛没有参照物。瓦垄沿坡向从脊走到檐，
+                  **每条垄的走向本身就是屋面的剖面曲线**，
+                  有了参照线，凹曲就一眼可辨。
+    tile_w      : 瓦垄间距（米）
+    tile_h      : 瓦垄凸起高度（米）
     """
     ridge_h = float(ridge_h)
     eave_h = float(eave_h)
@@ -502,6 +1055,83 @@ def curved_roof(name, width, depth, ridge_h=2.2, eave_h=0.0, overhang=0.55,
             if prev is not None:
                 add_bar(prev, cur, 0.16, 1)
             prev = cur
+
+    # ---- 瓦垄（筒瓦）：平行于坡向，在垂脊处裁断 ----
+    # LESSONS [042]：这是让"反宇曲率可见"的关键。
+    # 光有曲面时两个评审一致说"像平直斜面"——眼睛没有参照物。
+    # 瓦垄沿坡向从脊走到檐，**每条垄的走向本身就是屋面的剖面曲线**，
+    # 有了参照线，凹曲就一眼可辨。
+    # 关键 1：垄线必须**贴合曲面**（每点 z 取 height(x,y)），
+    #         若用直线插值，垄线自己就成了直线，参照物反而掩盖了曲率。
+    # 关键 2：垄**平行于坡向**，不是扇形。扇形版本会让前坡最外垄与侧坡最外垄
+    #         落在同一条垂脊线上，两套几何重叠 -> Z-fighting ->
+    #         评审报"瓦垄在屋脊处衔接不连续"。
+    #         正确做法：沿坡向走到垂脊就停（起点 t0 由几何算出）。
+    if tile_ridges and tile_ridges > 0:
+        _TW = max(0.05, float(tile_w))
+        _TH = max(0.005, float(tile_h))
+        _SEG = 16          # 每条垄沿坡向的段数
+        _HALF = 5          # 每垄横截面采样点数（半圆）
+        _hw = _TW * 0.40   # 垄半宽
+
+        def _sweep(t0, path_fn, perp_fn):
+            """沿坡向生成一条垄并铺面。t0 是坡向起点（0=脊，>0 表示被垂脊截断）。"""
+            if t0 >= 0.985:
+                return
+            span = 1.0 - t0
+            rows = []
+            for i in range(_SEG + 1):
+                t = t0 + span * i / _SEG
+                cx, cy = path_fn(t)
+                row = []
+                for j in range(_HALF + 1):
+                    s = -1.0 + 2.0 * j / _HALF
+                    dx, dy = perp_fn(s)
+                    px, py = cx + dx, cy + dy
+                    pz = height(px, py)
+                    bulge = math.sqrt(max(0.0, 1.0 - s * s))
+                    row.append((px, py, pz + _TH * bulge))
+                rows.append(row)
+            for i in range(_SEG):
+                for j in range(_HALF):
+                    a = rows[i][j]
+                    b = rows[i][j + 1]
+                    c = rows[i + 1][j + 1]
+                    d = rows[i + 1][j]
+                    nrm = (Vector(b) - Vector(a)).cross(Vector(d) - Vector(a))
+                    if nrm.z < 0:
+                        add_quad_geo([a, d, c, b], 0)
+                    else:
+                        add_quad_geo([a, b, c, d], 0)
+
+        # ---- 前坡 / 后坡：垄沿 y 走向（脊 -> 檐），x 固定 ----
+        # 起点 t0 = (|x| - Rx) / (W/2 - Rx)：x 超出正脊半跨时，
+        # 该垄在到达正脊之前就先碰上垂脊，必须在那里停。
+        _n1 = max(2, int(round(W / _TW)))
+        _span_x = max(1e-6, W * 0.5 - Rx)
+        for _sgn in (-1.0, 1.0):
+            for k in range(_n1):
+                _x0 = -W * 0.5 + _TW * (k + 0.5)
+
+                def _path(t, _sgn=_sgn, _x0=_x0):
+                    return (_x0, _sgn * t * halfD)
+
+                _t0 = max(0.0, (abs(_x0) - Rx) / _span_x)
+                _sweep(_t0, _path, lambda s: (_hw * s, 0.0))
+
+        # ---- 左坡 / 右坡：垄沿 x 走向（脊端 -> 檐角），y 固定 ----
+        # 起点 t0 = |y| / halfD：靠近正脊端（y≈0）的垄已经到顶，
+        # 靠檐边的垄（|y|→halfD）几乎立刻碰上垂脊。
+        _n2 = max(2, int(round(D / _TW)))
+        for _sx in (-1.0, 1.0):
+            for k in range(_n2):
+                _y0 = -halfD + _TW * (k + 0.5)
+
+                def _path(t, _sx=_sx, _y0=_y0):
+                    return (_sx * (Rx + (W * 0.5 - Rx) * t), _y0)
+
+                _t0 = min(0.98, abs(_y0) / halfD)
+                _sweep(_t0, _path, lambda s: (0.0, _hw * s))
 
     # 4 条檐口板：封住坡面下沿，消除"悬浮"感
     for p0, p1 in (((-W * 0.5, -halfD), (W * 0.5, -halfD)),
@@ -688,6 +1318,16 @@ def setup(engine='BLENDER_EEVEE', res=(1200, 900), samples=32, bg=(0.05, 0.06, 0
             sc.eevee.taa_render_samples = max(1, int(samples))
         except Exception:
             pass
+        # LESSONS [063]：EEVEE 默认 `use_animated_seed=True`，
+        # 每帧换随机种子 → **同一场景两次渲染的 PNG 哈希不同**。
+        # 后果：跨轮"同机位对照"根本不是同一张图，
+        # 视觉评审的结论因此有运行间方差（实测同一模型
+        # 4/4 PASS 与 2/4 FAIL 都出现过）。必须钉死种子。
+        for _k, _v in (("use_animated_seed", False), ("seed", 0)):
+            try:
+                setattr(sc.eevee, _k, _v)
+            except Exception:
+                pass
     else:
         try:
             sc.cycles.samples = max(1, int(samples))
@@ -844,9 +1484,13 @@ def _frame_camera(margin=1.28, lens=50.0, direction=(0.9, -1.25, 0.62)):
             for _p in _corners:
                 _q = _inv @ _p
                 _depth = max(-_q.z, 1e-3)      # 相机前方深度
+                # 边距是**乘数**不是除数：主体要留 margin 的余量，
+                # 就要求深度 >= margin * |q.x| / tan_x。
+                # 写成 / (tan_x * margin) 会让要求深度**变小**，
+                # 等于放宽取景，主体可以溢出画面（实测 under 图左侧触边）。
                 _need = max(_need,
-                            abs(_q.x) / (_tan_x * margin) - _depth,
-                            abs(_q.y) / (_tan_y * margin) - _depth)
+                            abs(_q.x) * margin / _tan_x - _depth,
+                            abs(_q.y) * margin / _tan_y - _depth)
             if abs(_need) < 1e-3:
                 break
             _dist = max(0.05, _dist + _need)
@@ -922,7 +1566,79 @@ if _LOCK and _KIND in _LOCK:
     print("CAM_LOCKED %s" % _KIND)
 
 if not _locked:
-    if _KIND in _DIRS:
+    if _KIND == "detail":
+        # 拱顶局部大样：只框跨中一小段，正交 3/4 视角。
+        # 理由：别压咬合是**亚米级**的局部细节，在整桥 900px 的画面里
+        # 根本读不出来（视觉评审反复判"未能观察到两根梁互相别压咬合"）。
+        # 这正是建筑做法图里"节点大样"的作用。
+        _cx = _ctr.x
+        _half_x = _size.x * 0.20
+        _sel = [p for p in _pts if abs(p.x - _cx) <= _half_x] or _pts
+        _lo2 = _V2((min(p.x for p in _sel), min(p.y for p in _sel),
+                    min(p.z for p in _sel)))
+        _hi2 = _V2((max(p.x for p in _sel), max(p.y for p in _sel),
+                    max(p.z for p in _sel)))
+        _c2 = (_lo2 + _hi2) * 0.5
+        _cam.data.type = 'ORTHO'
+        _dirv = _V2((0.55, -1.0, 0.30)).normalized()
+        _cam.location = _c2 + _dirv * _extent * 2.0
+        _cam.rotation_euler = (_c2 - _cam.location).to_track_quat('-Z', 'Y').to_euler()
+        _rot = _cam.rotation_euler.to_matrix()
+        _right, _up = _rot.col[0], _rot.col[1]
+        _xx = [_right.dot(p - _c2) for p in _sel]
+        _yy = [_up.dot(p - _c2) for p in _sel]
+        _rx = _sc.render.resolution_x or 1
+        _ry = _sc.render.resolution_y or 1
+        _need_w = max(_xx) - min(_xx)
+        _need_h = (max(_yy) - min(_yy)) * (_rx / float(_ry))
+        _cam.data.ortho_scale = max(_need_w, _need_h) * 1.35
+        _cam.data.clip_start = 0.001
+        _cam.data.clip_end = _extent * 10
+        print("VIEW detail (拱顶局部大样, ortho=%.2f)" % _cam.data.ortho_scale)
+    elif _KIND == "under":
+        # 仰视机位：从桥下**侧下方**看拱底。
+        # 《清明上河图》里船夫仰望虹桥木构 —— 这也是唯一能看清
+        # **三维编织**的角度：正交侧视里各肋完全重叠，只剩两条折线，
+        # 视觉评审因此判"呈平行双层木梁，未见 X 形交叉"。
+        # 相机压到接近起拱线的高度并斜看拱底，
+        # 斜跨的横向苗与纵向拱肋的交叉才成菱形网格。
+        _cam.data.type = 'PERSP'
+        _cam.data.lens = 20.0
+        _target = _V2((_ctr.x, _ctr.y, _ctr.z + _size.z * 0.10))
+        _off = _V2((-_extent * 0.22, -_extent * 0.46,
+                    _lo.z + _size.z * 0.16 - _target.z))
+        _dirv = _off.normalized()
+        # 自动取景：这个机位不像正交那样有精确框选，
+        # 苗一斜跨场景就变宽，会把画面裁掉（实测 under 图左右触边）。
+        # 但**只退不进**：若允许拉近，取景循环会把相机推到包围盒之外，
+        # 构图垮掉（实测 dist 从 15 涨到 34，桥面反而占满画面）。
+        _tan_x = _cam.data.sensor_width / (2.0 * _cam.data.lens)
+        _ar = _sc.render.resolution_x / max(_sc.render.resolution_y, 1)
+        _sh = (_cam.data.sensor_width / _ar) if _ar >= 1.0 else _cam.data.sensor_width
+        _tan_y = _sh / (2.0 * _cam.data.lens)
+        _dist0 = _off.length
+        _dist = _dist0
+        for _it in range(10):
+            _cam.location = _target + _dirv * _dist
+            _cam.rotation_euler = (_target - _cam.location).to_track_quat('-Z', 'Y').to_euler()
+            bpy.context.view_layer.update()
+            _inv = _cam.matrix_world.inverted()
+            _need = 0.0
+            for _p in _pts:
+                _q = _inv @ _p
+                _depth = max(-_q.z, 1e-3)
+                _need = max(_need,
+                            abs(_q.x) * 1.20 / _tan_x - _depth,
+                            abs(_q.y) * 1.20 / _tan_y - _depth)
+            if _need <= 1e-3:
+                break
+            # _need 是"还需要再退多远"，必须**累加**到当前距离上，
+            # 不能从 dist0 重算（那样每次迭代都把已退的距离丢掉）。
+            _dist = max(_dist0, _dist + _need * 1.05)
+        _cam.data.clip_start = 0.001
+        _cam.data.clip_end = _extent * 10
+        print("VIEW under (侧下方仰视拱底, dist=%.2f)" % _dist)
+    elif _KIND in _DIRS:
         _cam.data.type = 'ORTHO'
         _cam.location = _ctr + _DIRS[_KIND] * _extent * 2.0
         _cam.rotation_euler = (_ctr - _cam.location).to_track_quat('-Z', 'Y').to_euler()
@@ -931,10 +1647,21 @@ if not _locked:
         _right, _up = _rot.col[0], _rot.col[1]
         _xx = [_right.dot(p - _ctr) for p in _pts]
         _yy = [_up.dot(p - _ctr) for p in _pts]
-        _cam.data.ortho_scale = max(max(_xx) - min(_xx), max(_yy) - min(_yy)) * 1.16
+        # Blender 的 ortho_scale 映射到渲染的**长边**（本项目横图 = x），
+        # 短边的可视范围 = ortho_scale * (ry / rx)。
+        # 所以竖向需求必须先换算成 ortho_scale 的需求：h * (rx / ry)。
+        # 早前直接写 max(w, h)，横图上会把竖向裁掉
+        # （实测：虹桥 right 视图 ortho=10.67，短边只显示 7.1m，
+        #   而桥高 8.43m —— 被裁，视觉评审独立指出"right 视图被裁切"）。
+        _rx = _sc.render.resolution_x or 1
+        _ry = _sc.render.resolution_y or 1
+        _need_w = max(_xx) - min(_xx)
+        _need_h = (max(_yy) - min(_yy)) * (_rx / float(_ry))
+        _cam.data.ortho_scale = max(_need_w, _need_h) * 1.16
         _cam.data.clip_start = 0.001
         _cam.data.clip_end = _extent * 10
-        print("VIEW %s ortho scale=%.2f" % (_KIND, _cam.data.ortho_scale))
+        print("VIEW %s ortho scale=%.2f (需宽 %.2f 需高 %.2f, rx/ry=%.2f)" % (
+            _KIND, _cam.data.ortho_scale, _need_w, _need_h, _rx / float(_ry)))
     else:
         _cam.data.type = 'PERSP'
         print("VIEW persp")
@@ -944,7 +1671,11 @@ if _CLAY:
     _sc.render.engine = 'BLENDER_WORKBENCH'
     _sc.render.use_compositing = False
     _sc.display.shading.light = 'STUDIO'
-    _sc.display.shading.color_type = 'SINGLE'
+    # 灰模用**按物体随机着色**，不是单一灰。
+    # 单色灰模把几百根构件刷成一片，密集的编织网格全糊在一起
+    # （视觉评审原话："彩陶渲染图细节显示结构过于简化和平滑"）。
+    # 随机着色仍是"无材质无灯光"的纯形体证据，但体系分得开。
+    _sc.display.shading.color_type = 'RANDOM'
     _sc.display.shading.single_color = (0.55, 0.55, 0.55)
     # 正交顶视会出阴影条带故关掉；但透视灰模需要阴影才看得出形体起伏
     # （实测全关后 StdDev 只有 11，形体读不出来）
@@ -1046,13 +1777,24 @@ class Session:
         if blocked:
             return {"status": "blocked", "message": blocked}
 
+        # LESSONS [045]：增量修改。模型可在代码开头写
+        #     KEEP = ["构件前缀", ...]
+        # harness 提取它并注入 _KEEP，clear_scene() 随即只删除保留集合之外的构件。
+        keep = self._parse_keep(code)
+        if keep is not None:
+            print("  [keep] 增量模式：保留 %d 项 -> %s"
+                  % (len(keep), ", ".join(keep[:12])
+                     + (" ..." if len(keep) > 12 else "")))
+
         # LESSONS [015]：addon 用 exec(code, {"bpy": bpy}) 执行，命名空间里没有 __name__，
         # 而 builtins 模块字典里有 __name__='builtins'，导致模型常写的
         #     if __name__ == "__main__": main()
         # 守卫为 False，整个脚本静默不执行却返回 success。
         # 注入 __name__ 让守卫成立。
         # 注入安全助手库（LESSONS [022]）—— 模型可直接调用 box/cyl/prism/beam/mat/setup/stats
-        code = "__name__ = '__main__'\n" + PRELUDE + "\n# ---- 用户代码 ----\n" + code
+        code = ("__name__ = '__main__'\n"
+                + "_KEEP = %r\n" % (keep,)
+                + PRELUDE + "\n# ---- 用户代码 ----\n" + code)
         r = self.c.execute_code(code)
 
         # 后置校验：exec 成功 ≠ 场景有东西。空场景必须当失败报回去。
@@ -1066,6 +1808,84 @@ class Session:
                         "请确保脚本顶层直接执行建模代码。"}
             r.setdefault("result", {})["mesh_count"] = n
         return r
+
+    @staticmethod
+    def _parse_keep(code: str) -> list[str] | None:
+        """从模型代码里提取 KEEP = [...] 增量声明。"""
+        m = re.search(r"^\s*KEEP\s*=\s*\[(.*?)\]", code, re.S | re.M)
+        if not m:
+            return None
+        items = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+        return items or None
+
+    def object_names(self) -> list[str]:
+        """当前场景的构件名（供模型决定增量时保留哪些）。"""
+        r = self.c.execute_code(
+            "import bpy\n"
+            "print('OBJNAMES ' + '|'.join(sorted("
+            "o.name for o in bpy.context.scene.objects if o.type == 'MESH')))\n")
+        out = str(r.get("result", {}).get("result", ""))
+        m = re.search(r"OBJNAMES\s*(.*)", out)
+        if not m:
+            return []
+        return [x for x in m.group(1).split("|") if x]
+
+    # ---------------- 快照 / 回滚（LESSONS [046]）----------------
+    def snapshot(self, path: str) -> str | None:
+        """把当前场景存成 .blend 快照。
+
+        用 save_as_mainfile(copy=True) —— copy=True 只另存一份，
+        **不改变**当前会话打开的文件，也就不会影响 MCP 通道。
+        """
+        code = (
+            "import bpy, os\n"
+            "_p = r'%s'\n"
+            "os.makedirs(os.path.dirname(_p), exist_ok=True)\n"
+            "bpy.ops.wm.save_as_mainfile(filepath=_p, copy=True)\n"
+            "print('SNAPSHOT ' + _p)\n"
+        ) % path.replace("\\", "\\\\")
+        r = self.c.execute_code(code)
+        if r.get("status") != "success":
+            print("  [snap] 失败:", str(r.get("message"))[:200])
+            return None
+        print("  [snap] 已存快照 %s" % os.path.basename(path))
+        return path if os.path.exists(path) else None
+
+    def restore(self, path: str) -> bool:
+        """从 .blend 快照恢复场景。
+
+        **不用** bpy.ops.wm.open_mainfile —— 那会整体重载文件，
+        有重置插件状态的风险（LESSONS [002] 同样禁掉了 read_homefile）。
+        改用 bpy.data.libraries.load 把对象追加进当前场景，
+        只动数据不动会话。
+        """
+        if not os.path.exists(path):
+            print("  [restore] 快照不存在:", path)
+            return False
+        code = (
+            "import bpy\n"
+            "_p = r'__PATH__'\n"
+            "for _o in list(bpy.data.objects):\n"
+            "    bpy.data.objects.remove(_o, do_unlink=True)\n"
+            "with bpy.data.libraries.load(_p, link=False) as (_src, _dst):\n"
+            "    _dst.objects = _src.objects\n"
+            "_sc = bpy.context.scene.collection\n"
+            "for _o in bpy.data.objects:\n"
+            "    if _o.name not in _sc.objects:\n"
+            "        _sc.objects.link(_o)\n"
+            "bpy.context.view_layer.update()\n"
+            "_n = sum(1 for _o in _sc.objects if _o.type == 'MESH')\n"
+            "print('RESTORED ' + str(_n))\n"
+        ).replace("__PATH__", path.replace("\\", "\\\\"))
+        r = self.c.execute_code(code)
+        if r.get("status") != "success":
+            print("  [restore] 失败:", str(r.get("message"))[:200])
+            return False
+        out = str(r.get("result", {}).get("result", ""))
+        m = re.search(r"RESTORED\s+(\d+)", out)
+        n = int(m.group(1)) if m else -1
+        print("  [restore] 已恢复 %d 个 MESH 构件" % n)
+        return n > 0
 
     def mesh_count(self) -> int:
         r = self.c.execute_code(
@@ -1111,6 +1931,55 @@ class Session:
             return "未知"
         return f"宽 {s[0]:.2f}m × 深 {s[1]:.2f}m × 高 {s[2]:.2f}m"
 
+    def component_dims(self) -> list[tuple[str, int, float, float, float]]:
+        """按构件族（对象名 '_' 前的部分）量取各自尺寸。
+
+        动机（LESSONS [043]）：只把"整体包围盒"喂给 critic 时，
+        它无法分辨哪个数字属于哪个构件 —— 实测它连续三次把
+        **屋檐出挑的 5.26m** 当成"基座深度"判 FAIL，
+        而基座实测精确是 4.00m。
+        分族给出尺寸后，"基座是否 8×4×3"才有唯一答案。
+        """
+        code = (
+            "import bpy\n"
+            "from mathutils import Vector as _Vb\n"
+            "bpy.context.view_layer.update()\n"
+            "_fams = {}\n"
+            "for _o in bpy.context.scene.objects:\n"
+            "    if _o.type != 'MESH' or _o.hide_render:\n"
+            "        continue\n"
+            "    _k = _o.name.split('_')[0] or _o.name\n"
+            "    _fams.setdefault(_k, []).append(_o)\n"
+            "for _k, _objs in sorted(_fams.items()):\n"
+            "    _pts = [_o.matrix_world @ _Vb(_c) for _o in _objs for _c in _o.bound_box]\n"
+            "    if not _pts:\n"
+            "        continue\n"
+            "    print('FAM %s %d %.3f %.3f %.3f' % (_k, len(_objs),\n"
+            "        max(p.x for p in _pts)-min(p.x for p in _pts),\n"
+            "        max(p.y for p in _pts)-min(p.y for p in _pts),\n"
+            "        max(p.z for p in _pts)-min(p.z for p in _pts)))\n"
+        )
+        r = self.c.execute_code(code)
+        out = str(r.get("result", {}).get("result", ""))
+        res = []
+        for line in out.splitlines():
+            m = re.match(r"FAM\s+(\S+)\s+(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
+                         line.strip())
+            if m:
+                res.append((m.group(1), int(m.group(2)),
+                            float(m.group(3)), float(m.group(4)),
+                            float(m.group(5))))
+        return res
+
+    def component_dims_str(self) -> str:
+        rows = self.component_dims()
+        if not rows:
+            return "（未量到构件）"
+        out = []
+        for fam, n, w, d, h in rows:
+            out.append(f"  {fam:<14} {n:>3} 件   宽 {w:6.2f} × 深 {d:6.2f} × 高 {h:6.2f} m")
+        return "\n".join(out)
+
     def render(self, name: str) -> str | None:
         """单视图（3/4 透视）。保持返回路径，兼容既有调用。"""
         path, _cam = self._render_one(name, "persp")
@@ -1130,6 +1999,8 @@ class Session:
             ("front", "front", False),
             ("right", "right", False),
             ("back", "back", False),
+            ("under", "under", False),
+            ("detail", "detail", False),
             ("clay", "persp", True),
         ]
         cam_states = {}
@@ -1308,8 +2179,10 @@ CRITIC_SYSTEM = """你是严格的三维视觉评审。你会看到同一模型�
   "invariants": ["下一轮必须保持不变的要求"],
   "actions": ["可直接翻译成代码的修改动作"]
 }
-6. actions 要能落到这些助手上：屋顶→curved_roof()，材质→wood_mat()/stone_mat()，
-   锐边→bevel()，接缝→让构件共享端点坐标。
+6. actions 要能落到这些助手上：屋顶→curved_roof()，木构→dougong() / hongqiao()，
+   材质→wood_mat()/stone_mat()，锐边→bevel()，接缝→让构件共享端点坐标。
+   **做历史建筑必须先查形制来源**（见 LESSONS [048]）：
+   评审说"不像"时，先怀疑形制假设，别只改渲染参数。
 7. 若 total >= 8 且无 fail 项，verdict 用 "keep"。
 只输出 JSON，不要多余文字。"""
 
@@ -1429,12 +2302,24 @@ def main() -> int:
             keep = last_verdict.get("invariants") or []
             keep_txt = ("\n".join(f"  - {k}" for k in keep)
                         if keep else "  （无，本轮请自行保持已正确的部分）")
+            names = s.object_names()
+            # 只列族前缀，避免清单过长（同名族用前缀表示）
+            fams = sorted({n.split("_")[0] for n in names})
             user = [{"type": "text", "text":
                      f"建模目标：{args.goal}\n\n"
                      "上一轮的评审意见：\n" + "\n".join(history[-1:]) + "\n\n"
                      f"**以下这些上一轮已经做对，本轮必须保持不变：**\n{keep_txt}\n\n"
-                     "请写出**完整替换版**代码（包含清场），修正上述问题，"
-                     "同时严格遵守上面的保持不变项。不要只给补丁。"}]
+                     f"当前场景已有构件族（按 '_' 前缀分组）：{', '.join(fams)}\n"
+                     f"（共 {len(names)} 个构件）\n\n"
+                     "**本轮你可以二选一：**\n"
+                     "(A) 完整重写：清场后重建全部（默认，稳妥）。\n"
+                     "(B) 增量修改：只重建需要改的部分。在代码**最前面**单独写一行\n"
+                     "    KEEP = [\"要保留的构件名或前缀\", ...]\n"
+                     "    harness 会自动删掉不在此列表里的构件并保留这些，"
+                     "你的代码只写要改的部分。\n"
+                     "    适合：评审只指出了个别构件的问题，而其它部分已经做对。\n"
+                     "    注意：保留的构件若位置/大小需要改，请直接对它设置 transform 或删除重建。\n\n"
+                     "两种方式都要先调用 clear_scene()。请直接给出代码，不要解释。"}]
 
         t0 = time.time()
         text = ask_retry(client, model, BUILD_SYSTEM, user, tag="build")
@@ -1468,8 +2353,13 @@ def main() -> int:
         print(f"  [render] {len(shots)} 通道 -> "
               + ", ".join(os.path.basename(p) for _, p in shots))
 
+        # 快照：每轮存一份场景，便于回滚到最佳轮（LESSONS [046]）
+        snap_path = os.path.join(OUT_DIR, "snap", f"round{rnd}.blend")
+        s.snapshot(snap_path)
+
         t1 = time.time()
         bbox = s.scene_bbox()
+        fams = s.component_dims_str()
         labels = {
             "hero": "hero（透视，带材质）",
             "front": "正视图（正交，-Y 方向）",
@@ -1485,12 +2375,18 @@ def main() -> int:
                        f"建模目标：{args.goal}\n\n"
                        f"实测数据（Blender 直接量取，比看图估算准确，以此为准）：\n"
                        f"  构件数 = {res.get('result', {}).get('mesh_count', '?')}\n"
-                       f"  包围盒 = {bbox}\n"
+                       f"  整体包围盒 = {bbox}\n"
+                       f"  分构件族实测尺寸（每个族各自量取）：\n"
+                       f"{fams}\n"
                        + (f"  ⚠ 取景提示：{s.overflow_note}\n"
                           if s.overflow_note else
                           "  取景提示：本轮与基准机位一致，视图无裁切。\n")
-                       + f"\n注意：第 5 张是灰模，它只反映**形体**；如果灰模上形体正确而彩色图看着不对，\n"
-                       f"那是材质/光照问题，不要当成建模缺陷。请用实测数字做尺寸核对。"})
+                       + f"\n注意 1：第 5 张是灰模，它只反映**形体**；如果灰模上形体正确而彩色图看着不对，\n"
+                       f"那是材质/光照问题，不要当成建模缺陷。\n"
+                       f"注意 2：核对尺寸时**必须用上面的分族实测值**，不要用整体包围盒去套某个构件。\n"
+                       f"例如「基座宽8深4」要对比基座那一族的行；整体包围盒包含了屋檐出挑，\n"
+                       f"比基座大是正常的，不算超标。\n"
+                       f"注意 3：看不清的项请写 unclear 并说明原因，"})
         verdict_text = ask_retry(critic_client, c_model, CRITIC_SYSTEM, blocks,
                                  max_tokens=3072, tag="critic")
         if verdict_text is None:
@@ -1544,8 +2440,6 @@ def main() -> int:
             print(f"  [warn] 连续两轮未改善（{scores[-2]} -> {scores[-1]} -> {total}），"
                   f"下一轮应换建模路线而非微调")
         scores.append(total)
-
-        scores.append(total)
         last_verdict = verdict
 
         history.append(json.dumps(verdict, ensure_ascii=False, indent=2))
@@ -1554,6 +2448,15 @@ def main() -> int:
         print(f"\n[best] round={best[1]} total={best[0]}  image={best[3]}")
         with open(os.path.join(OUT_DIR, "best_verdict.json"), "w", encoding="utf-8") as f:
             json.dump(best[2], f, ensure_ascii=False, indent=2)
+        # 回滚到最佳轮的场景（若最佳轮不是最后一轮）
+        best_snap = os.path.join(OUT_DIR, "snap", f"round{best[1]}.blend")
+        if os.path.exists(best_snap) and best[1] != rnd:
+            print(f"[restore] 最佳轮是第 {best[1]} 轮（当前第 {rnd} 轮），回滚场景")
+            s.restore(best_snap)
+            # 回滚后重新出证据图，保证 out/ 里的图与最终场景一致
+            s.render_views("final")
+        else:
+            print(f"[restore] 当前场景即最佳轮（第 {best[1]} 轮），无需回滚")
     return 0
 
 
