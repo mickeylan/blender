@@ -1,6 +1,7 @@
-"""055型万吨级驱逐舰公开外形概念模型。
-非工程精确模型：仅依据公开影像表现外形、比例和主要可识别构件。
-Blender 5.2/MCP safe：手动清场，不调用 read_factory_settings。
+"""055 型万吨级驱逐舰——公开外形级重建版。
+
+本版本先建立真正的舰体轮廓，再叠加上层建筑；不是工程图纸，也不涉及内部
+系统。坐标：X 为舰艏方向（正 X 艏），Y 为左右舷，Z 为高度。
 """
 import bpy, math, os
 from mathutils import Vector
@@ -24,82 +25,88 @@ def mat(name,col,rough=.55,metal=0):
 
 def cube(n,loc,sc,m,rot=(0,0,0),bev=.03):
     bpy.ops.mesh.primitive_cube_add(location=loc,rotation=rot); o=active(); o.name=n; o.scale=sc; o.data.materials.append(m)
-    if bev:b=o.modifiers.new('Edge','BEVEL'); b.width=bev;b.segments=2
+    if bev:b=o.modifiers.new('Edge','BEVEL');b.width=bev;b.segments=2
     return o
 
 def cyl(n,loc,r,d,m,verts=20,rot=(0,0,0)):
     bpy.ops.mesh.primitive_cylinder_add(vertices=verts,radius=r,depth=d,location=loc,rotation=rot);o=active();o.name=n;o.data.materials.append(m);return o
 
-def cone(n,loc,r1,r2,d,m,verts=20):
-    bpy.ops.mesh.primitive_cone_add(vertices=verts,radius1=r1,radius2=r2,depth=d,location=loc);o=active();o.name=n;o.data.materials.append(m);return o
-
 def beam(n,a,b,r,m):
     a=Vector(a);b=Vector(b);d=b-a;o=cyl(n,(a+b)/2,r,d.length,m,12);o.rotation_euler=d.to_track_quat('Z','Y').to_euler();return o
 
+def mesh_obj(name,verts,faces,m):
+    me=bpy.data.meshes.new(name+'Mesh');me.from_pydata(verts,[],faces);me.materials.append(m);o=bpy.data.objects.new(name,me);bpy.context.collection.objects.link(o);return o
+
+def tapered_block(name,x0,x1,y0,y1,z0,z1,top_y0,top_y1,top_z,m):
+    # 8点斜收上层建筑
+    v=[(x0,-y0,z0),(x0,y0,z0),(x1,y0,z0),(x1,-y0,z0),
+       (x0,-top_y0,top_z),(x0,top_y0,top_z),(x1,top_y1,top_z),(x1,-top_y1,top_z)]
+    f=[(0,1,2,3),(4,7,6,5),(0,4,5,1),(1,5,6,2),(2,6,7,3),(3,7,4,0)]
+    return mesh_obj(name,v,f,m)
+
+def hull(m):
+    # 从艏到艉的横截面：尖艏、宽船腰、收艉；每截面绕一圈形成连续船壳
+    stations=[(-8.6,.18,1.50,.32),(-7.8,.95,1.62,.30),(-6.0,1.42,1.82,.28),(-3.0,1.70,1.98,.25),(1.5,1.72,2.00,.25),(5.2,1.55,2.08,.26),(7.3,1.02,2.18,.30),(8.45,.10,2.28,.40)]
+    # y,z 轮廓：甲板边、舭部、龙骨，再回到另一舷
+    ring=[]; N=8
+    for x,bw,dz,keel in stations:
+        ring += [(x,-bw*.42,dz),(x,-bw,dz-.18),(x,-bw*.86,keel+.28),(x,-bw*.42,keel),(x,0,keel-.06),(x,bw*.42,keel),(x,bw*.86,keel+.28),(x,bw,dz-.18),(x,bw*.42,dz)]
+    verts=ring; faces=[]
+    for i in range(len(stations)-1):
+        for j in range(N+1):
+            a=i*9+j; b=i*9+(j+1)%9; c=(i+1)*9+(j+1)%9; d=(i+1)*9+j; faces.append((a,b,c,d))
+    faces.append(tuple(range(8,-1,-1))); faces.append(tuple((len(stations)-1)*9+j for j in range(9)))
+    return mesh_obj('HullMain',verts,faces,m)
+
 def main():
-    clear(); steel=mat('055_Hull',(0.075,.095,.11),.48,.15); dark=mat('055_Deck',(.035,.045,.052),.62); black=mat('055_Stealth',(.018,.024,.03),.35,.1); glass=mat('055_Glass',(.015,.06,.085),.18,.25); red=mat('055_DeckMark',(.65,.04,.025),.45); white=mat('055_Number',(.7,.72,.68),.4); rotor=mat('055_Rotor',(.025,.03,.035),.35,.3)
-    # hull: stacked tapered blocks create long stealth bow/stern silhouette
-    cube('HullLower',(0,0,1.15),(8.2,1.55,.55),steel,bev=.18)
-    cube('HullBelt',(0,0,1.75),(7.8,1.45,.32),steel,rot=(0,0,0),bev=.1)
-    cube('UpperSheer',(0,0,2.22),(6.9,1.30,.22),steel,rot=(0,0,0),bev=.08)
-    # raised angled bow shoulder and stern transom
-    cube('BowShoulder',(6.9,0,2.45),(1.55,1.15,.22),steel,rot=(0,math.radians(-7),0),bev=.08)
-    cube('SternDeck',(-6.3,0,2.48),(1.8,1.25,.18),dark,bev=.06)
-    cube('MainDeck',(0,0,2.58),(7.5,1.38,.10),dark,bev=.04)
-    # VLS grids front/rear: recognizable hatch rectangles
-    for base,count in ((4.0,4),(-4.1,6)):
+    clear()
+    hullmat=mat('055_Hull',(0.07,.085,.095),.46,.15); deckmat=mat('055_Deck',(.025,.035,.042),.68); stealth=mat('055_Stealth',(.012,.018,.024),.35,.1); glass=mat('055_Glass',(.01,.055,.08),.15,.25); red=mat('055_Mark',(.65,.035,.02),.42); white=mat('055_Number',(.72,.74,.70),.38); metal=mat('055_Metal',(.34,.17,.035),.35,.55); sea=mat('055_Sea',(.004,.025,.045),.18)
+    hull(hullmat)
+    # 甲板轮廓与舷侧折角带
+    cube('MainDeck',(0,0,2.18),(7.15,1.38,.08),deckmat,bev=.02)
+    beam('PortChine',(-7.8,-1.08,1.72),(6.8,-1.35,2.05),.045,stealth); beam('StarboardChine',(-7.8,1.08,1.72),(6.8,1.35,2.05),.045,stealth)
+    # 前后 VLS，嵌在甲板上，不再悬浮成外挂方块
+    for x,count in ((5.0,16),(-4.2,32)):
         for i in range(count):
-            x=base + (i-(count-1)/2)*.58
-            for y in (-.55,.55): cube('VLS_Hatch',(x,y,2.72),(.20,.20,.025),black,bev=.015)
-    # forward gun
-    cyl('MainGunBase',(5.55,0,3.0),.62,.18,black,32)
-    cube('MainGunStealth',(5.55,0,3.42),(.5,.42,.55),black,rot=(0,math.radians(-12),0),bev=.06)
-    beam('MainGunBarrel',(5.62,0,3.70),(7.15,0,3.84),.12,black)
-    # aft CIWS-like mounts
-    for x in (-5.0,-6.0):
-        cyl('WeaponMount',(x,0,3.05),.38,.15,black,24); cube('WeaponHousing',(x,0,3.38),(.30,.27,.28),black,bev=.04)
-    # integrated mast / forward superstructure
-    cube('ForwardIsland',(1.35,0,4.0),(2.0,1.02,1.35),steel,rot=(0,0,0),bev=.08)
-    cube('IslandSloped',(1.55,0,5.2),(1.65,.90,.32),black,rot=(0,math.radians(-8),0),bev=.05)
-    # bridge windows bands
-    for z in (4.45,4.72): cube('BridgeWindowBand',(1.05,-1.04,z),(1.3,.035,.08),glass,bev=.01)
-    # aft integrated funnel/superstructure
-    cube('AftIsland',(-2.5,0,4.0),(1.55,.92,1.05),steel,bev=.07)
-    cube('Funnel',(-2.8,0,5.15),(.62,.55,.65),black,rot=(0,0,0),bev=.05)
-    for y in (-.25,.25): cube('FunnelCap',(-2.8,y,5.82),(.48,.12,.08),black,bev=.02)
-    # mast and sensor panels
-    beam('IntegratedMast',(1.35,0,5.45),(1.35,0,8.0),.12,black)
-    for z in (5.9,6.45,7.0):
-        cube('AESA_Panel_F',(1.35,-.72,z),(.72,.08,.38),black,rot=(math.radians(-8),0,0),bev=.025)
-        cube('AESA_Panel_B',(1.35,.72,z),(.72,.08,.38),black,rot=(math.radians(8),0,0),bev=.025)
-    cyl('MastTop',(1.35,0,8.15),.24,.25,black,20)
-    # antenna/radar dishes
-    cyl('RadarHead',(1.35,0,7.55),.38,.12,black,24,rot=(math.pi/2,0,0)); beam('RadarArm',(1.35,0,7.5),(1.35,0,8.25),.045,black)
-    # side boats / deck fittings
-    for y in (-1.12,1.12): cube('BoatBay',(-1.0,y,2.85),(1.25,.18,.20),black,bev=.03)
-    # helicopter deck and hangar
-    cube('HelicopterDeck',(-5.0,0,2.78),(2.25,1.35,.10),dark,bev=.04)
-    cube('Hangar',(-3.65,0,3.45),(1.25,1.0,.62),steel,bev=.06)
-    # deck markings and helipad cross
-    beam('HelipadMark',(-5.0,-.85,2.91),(-5.0,.85,2.91),.035,red); beam('HelipadMark',(-5.85,0,2.91),(-4.15,0,2.91),.035,red)
-    # helicopter silhouette
-    cyl('HeliBody',(-5.0,0,3.25),.28,.95,rotor,16,rot=(0,math.pi/2,0)); beam('HeliTail',(-5.3,0,3.25),(-6.25,0,3.32),.08,rotor); beam('HeliRotor',(-5.0,-.7,3.55),(-5.0,.7,3.55),.035,rotor)
-    # hull number
-    text=bpy.data.curves.new('HullNumber','FONT');text.body='055';text.align_x='CENTER';text.size=.65;text.extrude=.01;o=bpy.data.objects.new('HullNumber',text);bpy.context.collection.objects.link(o);o.location=(-.2,-1.58,1.75);o.rotation_euler=(math.pi/2,0,0);o.data.materials.append(white)
-    # water plane
-    water=mat('Sea',(0.008,.035,.06),.2,0);cube('Water',(0,0,-.05),(18,8,.05),water,bev=.01)
-    # lights/world/camera
-    w=bpy.data.worlds.new('055_World');w.use_nodes=True;bg=next(n for n in w.node_tree.nodes if n.type=='BACKGROUND');bg.inputs['Color'].default_value=(.004,.008,.018,1);bg.inputs['Strength'].default_value=.22;bpy.context.scene.world=w
+            xx=x+(i%8-3.5)*.42; yy=(-.62 if i//8==0 else .62)
+            cube('VLS_FlushHatch',(xx,yy,2.29),(.15,.15,.018),stealth,bev=.01)
+    # 艏炮低矮隐身炮塔和长炮管
+    cyl('MainGunRing',(5.72,0,2.48),.72,.12,stealth,32)
+    tapered_block('MainGunTurret',5.25,6.25,.48,.40,2.48,2.48,.30,.30,2.98,stealth)
+    beam('MainGunBarrel',(5.72,0,3.02),(7.15,0,3.16),.105,stealth)
+    # 前部大体量综合舰桥：斜面收口，不用正方盒子
+    tapered_block('ForwardIsland',.1,3.35,1.02,1.0,2.28,2.28,.73,.68,5.25,hullmat)
+    tapered_block('BridgeUpper',.48,2.75,.78,.74,5.25,5.25,.60,.55,5.92,stealth)
+    # 连续斜窗带
+    for z in (4.45,4.72): cube('BridgeWindow',(1.52,-1.035,z),(1.0,.025,.075),glass,rot=(0,math.radians(-4),0),bev=.008)
+    # 后部低矮上层建筑、烟囱和直升机机库
+    tapered_block('AftIsland',-3.15,-1.15,.88,.84,2.28,2.28,.67,.62,4.85,hullmat)
+    tapered_block('Funnel',-3.0,-1.95,.48,.44,4.82,4.82,.34,.30,5.65,stealth)
+    cube('HelicopterHangar',(-4.15,0,3.35),(1.05,1.03,.62),hullmat,bev=.05)
+    cube('HelicopterDeck',(-6.25,0,2.30),(1.65,1.28,.07),deckmat,bev=.02)
+    beam('HMark1',(-6.95,-.82,2.40),(-5.55,.82,2.40),.025,red);beam('HMark2',(-6.95,.82,2.40),(-5.55,-.82,2.40),.025,red)
+    # 综合桅杆与四面阵列面板
+    beam('IntegratedMast',(1.62,0,5.85),(1.62,0,8.1),.11,stealth)
+    for z in (6.15,6.85,7.5):
+        cube('AESA_Port',(1.62,-.73,z),(.68,.07,.30),stealth,rot=(math.radians(-7),0,0),bev=.018)
+        cube('AESA_Starboard',(1.62,.73,z),(.68,.07,.30),stealth,rot=(math.radians(7),0,0),bev=.018)
+    cyl('MastTop',(1.62,0,8.35),.18,.32,stealth,20)
+    # 舷侧小艇舱门和标识
+    for y in (-1.43,1.43): cube('BoatBay',(-1.0,y,3.0),(1.05,.025,.28),stealth,bev=.01)
+    text=bpy.data.curves.new('HullNumber','FONT');text.body='055';text.align_x='CENTER';text.size=.52;text.extrude=.008;o=bpy.data.objects.new('HullNumber',text);bpy.context.collection.objects.link(o);o.location=(-1.1,-1.47,1.35);o.rotation_euler=(math.pi/2,0,0);o.data.materials.append(white)
+    cube('Water',(0,0,-.12),(18,8,.08),sea,bev=.01)
+    # 灯光、相机、四张轮廓验证图
+    w=bpy.data.worlds.new('055_World');w.use_nodes=True;bg=next(n for n in w.node_tree.nodes if n.type=='BACKGROUND');bg.inputs['Color'].default_value=(.003,.007,.016,1);bg.inputs['Strength'].default_value=.20;bpy.context.scene.world=w
     col=bpy.context.collection
-    for name,loc,en,color,size in [('Key',(8,-12,12),1700,(1,.55,.32),6),('Fill',(-8,8,8),1100,(.25,.45,1),5)]:
+    for name,loc,en,color,size in [('Key',(10,-14,12),1900,(1,.52,.28),6),('Fill',(-10,9,9),1300,(.25,.45,1),5)]:
         ld=bpy.data.lights.new(name,'AREA');ld.energy=en;ld.color=color;ld.shape='DISK';ld.size=size;ob=bpy.data.objects.new(name,ld);col.objects.link(ob);ob.location=loc;ob.rotation_euler=(Vector((0,0,2))-ob.location).to_track_quat('-Z','Y').to_euler()
-    cd=bpy.data.cameras.new('Type055_Camera');cam=bpy.data.objects.new('Type055_Camera',cd);col.objects.link(cam);bpy.context.scene.camera=cam;cd.lens=52
+    cd=bpy.data.cameras.new('Type055_Camera');cam=bpy.data.objects.new('Type055_Camera',cd);col.objects.link(cam);bpy.context.scene.camera=cam;cd.lens=55
     sc=bpy.context.scene;sc.render.engine='BLENDER_EEVEE';sc.render.resolution_x=1400;sc.render.resolution_y=800;sc.render.resolution_percentage=100;sc.render.image_settings.file_format='PNG';sc.view_settings.view_transform='AgX';sc.view_settings.look='AgX - Medium High Contrast'
-    views=[('type055_hero',(14,-18,9),(0,0,2.0)),('type055_bow',(15,-8,5),(4,0,2.7)),('type055_side',(0,-19,5),(0,0,2.4)),('type055_top',(7,-10,18),(0,0,2.5))]
+    views=[('type055_hero',(15,-18,8),(0,0,2.1)),('type055_bow',(15,-7,4.5),(4.5,0,2.25)),('type055_side',(0,-20,4.5),(0,0,2.1)),('type055_top',(5,-10,17),(0,0,2.0))]
     for n,loc,tgt in views:
         cam.location=loc;cam.rotation_euler=(Vector(tgt)-cam.location).to_track_quat('-Z','Y').to_euler();sc.render.filepath=os.path.join(OUT,n+'.png');bpy.ops.render.render(write_still=True)
     cam.location=views[0][1];cam.rotation_euler=(Vector(views[0][2])-cam.location).to_track_quat('-Z','Y').to_euler();bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT,'type055_destroyer.blend'))
-    print('TYPE055 BUILD OK objects=%d'%sum(o.type=='MESH' for o in bpy.data.objects))
+    print('TYPE055 REBUILD OK objects=%d'%sum(o.type=='MESH' for o in bpy.data.objects))
 try:main()
 except Exception:
  import traceback;traceback.print_exc();raise
